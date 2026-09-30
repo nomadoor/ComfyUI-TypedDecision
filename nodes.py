@@ -51,7 +51,8 @@ def question_from_mode(mode):
         if field in mode and not mode[field].strip():
             raise ValueError(f"{kind}: {field} is empty. The grey text in the box is only an example; type your own.")
     if kind == "noul":
-        return Question("noul", mode["instructions"].strip(), [(True, None), (False, None)])
+        return Question("noul", mode["instructions"].strip(),
+                        [(True, mode.get("criteria_true", "").strip() or None), (False, mode.get("criteria_false", "").strip() or None)])
     if kind == "choice":
         question = Question("choice", mode["instructions"].strip(), parse_options(mode["criteria"]))
         if len(question.answers) < 2:
@@ -145,6 +146,10 @@ class TypedDecision(io.ComfyNode):
                     io.DynamicCombo.Option("noul", [
                         io.String.Input("instructions", multiline=True, default="",
                                         placeholder="instructions: a claim to judge true or false, or a yes/no question.\ne.g. The image matches the prompt."),
+                        io.String.Input("criteria_true", multiline=True, default="", optional=True,
+                                        placeholder="criteria_true (optional): when the answer is yes.\ne.g. any letters, numbers, signature or logo, even small or faint"),
+                        io.String.Input("criteria_false", multiline=True, default="", optional=True,
+                                        placeholder="criteria_false (optional): when the answer is no.\ne.g. no visible writing or marks of any kind"),
                     ]),
                     io.DynamicCombo.Option("choice", [
                         io.String.Input("instructions", multiline=True, default="",

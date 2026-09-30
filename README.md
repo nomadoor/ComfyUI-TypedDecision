@@ -16,7 +16,7 @@ Typed decisions in ComfyUI: one question about images and text, answered with ca
 **Typed Decision** — answers one question. Write questions and options in English.
 
 - `mode`: `noul` (true / false), `choice` (one of the options), `score` (ordered levels)
-- `instructions` / `criteria`: the question, and the options or levels, one per line
+- `instructions` / `criteria`: the question, and the options or levels, one per line. noul takes optional `criteria_true` / `criteria_false` for when to answer yes or no.
 - `images`: 0-2 images. With two, the first is the reference and the second is the one to judge.
 - `state`: optional facts to judge against, as text or JSON
 - `debias`: average over several option orders (slower)
