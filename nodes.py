@@ -51,7 +51,8 @@ def question_from_mode(mode):
         if field in mode and not mode[field].strip():
             raise ValueError(f"{kind}: {field} is empty. The grey text in the box is only an example; type your own.")
     if kind == "noul":
-        return Question("noul", mode["instructions"].strip(), [(True, None), (False, None)])
+        return Question("noul", mode["instructions"].strip(),
+                        [(True, mode.get("criteria_true", "").strip() or None), (False, mode.get("criteria_false", "").strip() or None)])
     if kind == "choice":
         question = Question("choice", mode["instructions"].strip(), parse_options(mode["criteria"]))
         if len(question.answers) < 2:
@@ -144,19 +145,23 @@ class TypedDecision(io.ComfyNode):
                 io.DynamicCombo.Input("mode", options=[
                     io.DynamicCombo.Option("noul", [
                         io.String.Input("instructions", multiline=True, default="",
-                                        placeholder="instructions: a claim to judge true or false, or a yes/no question.\ne.g. The image matches the prompt."),
+                                        placeholder="instructions: a claim to judge true or false, or a yes/no question.\ne.g. Many people are in the image."),
+                        io.String.Input("criteria_true", multiline=True, default="", optional=True,
+                                        placeholder="criteria_true (optional): when the answer is yes.\ne.g. five or more people are visible"),
+                        io.String.Input("criteria_false", multiline=True, default="", optional=True,
+                                        placeholder="criteria_false (optional): when the answer is no.\ne.g. four or fewer people are visible"),
                     ]),
                     io.DynamicCombo.Option("choice", [
                         io.String.Input("instructions", multiline=True, default="",
-                                        placeholder="instructions: the question to answer.\ne.g. Which part of the prompt is missing from the image?"),
+                                        placeholder="instructions: the question to answer.\ne.g. What is the main subject of the image?"),
                         io.String.Input("criteria", multiline=True, default="",
-                                        placeholder="criteria: the options, one per line. Add ': description' to explain one.\ne.g.\nthe red car\nthe beach\nthe sunset\nnothing is missing"),
+                                        placeholder="criteria: the options, one per line. Add ': description' to explain one.\ne.g.\nperson\nanimal\nvehicle\nfood\nlandscape: scenery with no clear main subject"),
                     ]),
                     io.DynamicCombo.Option("score", [
                         io.String.Input("instructions", multiline=True, default="",
-                                        placeholder="instructions: the question to rate.\ne.g. How closely does the image follow the prompt?"),
+                                        placeholder="instructions: the question to rate.\ne.g. How usable is this photo for a training dataset?"),
                         io.String.Input("criteria", multiline=True, default="",
-                                        placeholder="criteria: the levels, one per line, lowest first.\ne.g.\nnot at all\npartly\nmostly\nfully"),
+                                        placeholder="criteria: the levels, one per line, lowest first.\ne.g.\nunusable: blurry, dark or badly cropped\npoor\nacceptable\ngood\nexcellent: sharp, well lit, subject fills the frame"),
                     ]),
                 ], tooltip="noul: true or false. choice: pick one option. score: rate on ordered levels. Write in English."),
                 TypedDecisionModel.Input("model"),
@@ -164,7 +169,7 @@ class TypedDecision(io.ComfyNode):
                     input=io.Image.Input("image"), prefix="image_", min=0),
                     tooltip="Images looked at together, in slot order. imajev: first = reference, second = the one to judge."),
                 io.String.Input("state", multiline=True, default="",
-                                placeholder="state: the facts to judge against (optional). Plain text or JSON.\ne.g. Prompt: a red sports car parked on a beach at sunset.",
+                                placeholder="state: the facts to judge against (optional). Plain text or JSON.\ne.g. full body shot of a knight standing in a castle hall",
                                 tooltip="With JSON, instructions can name its fields in `backticks`, e.g. `listing.color`."),
                 io.Float.Input("threshold", default=0.5, min=0.0, max=10.0, step=0.01, tooltip="pass is true when value >= threshold and the model did not abstain."),
                 io.Boolean.Input("debias", default=False, tooltip="Average over up to 4 option orders to cancel position bias. Slower, and changes little in practice."),
@@ -173,7 +178,7 @@ class TypedDecision(io.ComfyNode):
             outputs=[
                 io.Float.Output(display_name="value", tooltip="noul: probability the claim is true (0-1). choice: probability of the chosen option (0-1). "
                                 "score: expected level, 0 = first line (not a probability)."),
-                io.String.Output(display_name="label", tooltip="The answer: yes / no, the chosen option, or the most likely level."),
+                io.String.Output(display_name="label", tooltip="The answer: yes / no, the chosen option, or the most likely level. Not affected by threshold."),
                 io.Int.Output(display_name="index", tooltip="noul: yes = 1, no = 0. choice / score: line number of the answer, from 0."),
                 io.Boolean.Output(display_name="pass", tooltip="True when value >= threshold and the model did not abstain. Use it to branch."),
                 io.Boolean.Output(display_name="abstained", tooltip="True when the images and state are not enough to answer, e.g. to send the case to a person."),

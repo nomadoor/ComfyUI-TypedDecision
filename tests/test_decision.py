@@ -22,6 +22,11 @@ def test_noul_prompt_matches_official_layout():
         "A: yes\nB: no\nC: " + UNKNOWN_LINE)
 
 
+def test_noul_criteria_follow_yes_and_no():
+    q = Question("noul", "Damaged?", [(True, "the part is damaged"), (False, None)])
+    assert build_prompt({}, q, ["A", "B", "C"], 0).endswith("A: yes — the part is damaged\nB: no\nC: " + UNKNOWN_LINE)
+
+
 def test_choice_prompt_rotates_candidates_but_not_labels():
     q = Question("choice", "Which department?", [("billing", "Payments"), ("sales", None)])
     assert build_prompt("ticket text", q, ["A", "B", "C"], 1).endswith(
@@ -136,6 +141,8 @@ def test_question_from_mode():
     assert q == Question("choice", "Which?", [("a", None), ("b", "B")])
     q = question_from_mode({"mode": "noul", "instructions": "It is red."})
     assert q == Question("noul", "It is red.", [(True, None), (False, None)])
+    q = question_from_mode({"mode": "noul", "instructions": "It is red.", "criteria_true": " clearly red ", "criteria_false": ""})
+    assert q == Question("noul", "It is red.", [(True, "clearly red"), (False, None)])
 
 
 def test_empty_fields_explain_the_placeholder():
