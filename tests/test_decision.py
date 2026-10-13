@@ -5,9 +5,12 @@ import pytest
 import torch
 
 import comfy.text_encoders.qwen35
+import folder_paths
+from comfy_api.latest import io
 from typed_decision.imajev import (Question, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
                     render, rotation_offsets, select, temperature, tokenize)
-from typed_decision.nodes import answer, check_limits, parse_levels, parse_options, parse_state, question_from_mode
+from typed_decision.nodes import (LoadTypedDecisionModel, TypedDecision, answer, check_limits, parse_levels, parse_options, parse_state,
+                                  question_from_mode)
 
 UNKNOWN_LINE = "unknown — cannot be determined from the available evidence, the premise is false, or no listed option is correct"
 HEADER = ("Inspect the available evidence and answer the question using the stated criteria. "
@@ -191,3 +194,22 @@ def test_answer_score():
     known = [0.1 / 0.9, 0.2 / 0.9, 0.6 / 0.9]
     assert value == pytest.approx(known[1] + 2 * known[2]) and label == "high" and index == 2 and passed
     assert json.loads(result)["legend"] == {"0": "low", "1": "mid", "2": "high"}
+
+
+def schema_inputs(node):
+    return {i.id: i for i in node.define_schema().inputs}
+
+
+def test_load_node_offers_each_model_folder_with_its_settings(monkeypatch):
+    files = {"typed_decision": ["imajev-4b/decision_readout.json", "imajev-4b/adapter_config.json", "notes/readme.txt"],
+             "text_encoders": ["qwen3.5_4b_int8_convrot.safetensors"]}
+    monkeypatch.setattr(folder_paths, "get_filename_list", lambda name: files[name])
+    adapter = schema_inputs(LoadTypedDecisionModel)["adapter"]
+    assert isinstance(adapter, io.DynamicCombo.Input)
+    assert [o.key for o in adapter.options] == ["imajev-4b"]
+    settings = {i.id: i.default for i in adapter.options[0].inputs}
+    assert settings == {"debias": False, "calibration": True}
+
+
+def test_decision_node_keeps_only_question_inputs():
+    assert list(schema_inputs(TypedDecision)) == ["mode", "model", "images", "state", "threshold"]

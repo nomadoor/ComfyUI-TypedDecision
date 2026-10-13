@@ -151,7 +151,8 @@ class ImajevModel:
     max_images = 2
     max_levels = 10
 
-    def __init__(self, backbone_path, folder):
+    def __init__(self, backbone_path, folder, debias, calibrate):
+        self.debias = debias
         with open(os.path.join(folder, "adapter_config.json"), encoding="utf-8") as f:
             config = json.load(f)
         with open(os.path.join(folder, MARKER), encoding="utf-8") as f:
@@ -163,7 +164,7 @@ class ImajevModel:
         self.readout = comfy.utils.load_torch_file(os.path.join(folder, "decision_readout.safetensors"), safe_load=True)["weight"].float()
         if self.readout.shape[0] != len(manifest["codes"]):
             raise ValueError("decision_readout.safetensors and decision_readout.json disagree on the number of codes.")
-        self.calibration = self._load_calibration(folder)
+        self.calibration = self._load_calibration(folder) if calibrate else None
 
         clip = comfy.sd.load_clip(ckpt_paths=[backbone_path])
         mismatch = f"This adapter needs the Qwen3.5 backbone it was trained on (hidden size {self.readout.shape[1]})."
@@ -200,14 +201,14 @@ class ImajevModel:
                 return calibration
         return None
 
-    def decide(self, images, state, question, debias, calibrate):
+    def decide(self, images, state, question):
         """-> (probabilities over answers + unknown, selected index, calibration version or None)."""
         images = [prepare_image(image) for image in images]
         n = len(question.answers) + 1
         labels = [code for code, _ in self.codes[:n]]
         token_ids = [token for _, token in self.codes[:n]]
         readout = self.readout[:n]
-        offsets = rotation_offsets(n, debias)
+        offsets = rotation_offsets(n, self.debias)
         prompts, lengths = [], []
         for offset in offsets:
             tokens = tokenize(self.tokenizer, render(build_prompt(state, question, labels, offset), len(images)), images)
@@ -232,7 +233,7 @@ class ImajevModel:
             logits = combine_rotations(passes, n)
             selected = max(range(n), key=logits.__getitem__)
         t, version = None, None
-        if calibrate and self.calibration is not None:
+        if self.calibration is not None:
             t = temperature(self.calibration, question.kind, n - 1, photo_only=bool(images) and not state)
             version = self.calibration.get("calibration_version") if t is not None else None
         return softmax(logits, t or 1.0), selected, version

@@ -39,7 +39,10 @@ Search for **ComfyUI-TypedDecision** in ComfyUI Manager and install it.
 
 ## Nodes
 
-**Load Typed Decision Model**: pick Qwen3.5 as `backbone` and imajev-4b as `adapter`.
+**Load Typed Decision Model**: pick Qwen3.5 as `backbone` and imajev-4b as `adapter`. The model's own settings appear under `adapter`:
+
+- `debias`: average over several option orders (slower)
+- `calibration`: apply the model's temperature calibration
 
 **Typed Decision**: answers one question. Write questions and options in English.
 
@@ -47,7 +50,6 @@ Search for **ComfyUI-TypedDecision** in ComfyUI Manager and install it.
 - `instructions` / `criteria`: the question, and the options or levels, one per line. noul takes optional `criteria_true` / `criteria_false` for when to answer yes or no.
 - `images`: up to 2 images. With two, the first is the reference and the second is the one to judge.
 - `state`: optional facts to judge against, as text or JSON
-- `debias`: average over several option orders (slower)
 
 | Output | Meaning |
 | --- | --- |

@@ -67,11 +67,15 @@
       },
       "widgets_values": [
         "qwen3.5_4b_int8_convrot.safetensors",
-        "imajev-4b"
+        "imajev-4b",
+        false,
+        true
       ],
       "widgets_values_named": {
         "backbone": "qwen3.5_4b_int8_convrot.safetensors",
-        "adapter": "imajev-4b"
+        "adapter": "imajev-4b",
+        "adapter.debias": false,
+        "adapter.calibration": true
       },
       "color": "#232",
       "bgcolor": "#353"
@@ -153,9 +157,7 @@
         "at least one person, even if small or partly visible",
         "no people at all, including statues, drawings or reflections of people",
         "",
-        0.5,
-        false,
-        true
+        0.5
       ],
       "widgets_values_named": {
         "mode": "noul",
@@ -163,9 +165,7 @@
         "mode.criteria_true": "at least one person, even if small or partly visible",
         "mode.criteria_false": "no people at all, including statues, drawings or reflections of people",
         "state": "",
-        "threshold": 0.5,
-        "debias": false,
-        "calibration": true
+        "threshold": 0.5
       },
       "color": "#232",
       "bgcolor": "#353"

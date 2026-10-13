@@ -108,6 +108,13 @@ def decision_folders():
     return sorted({os.path.dirname(f) for f in folder_paths.get_filename_list("typed_decision") if os.path.basename(f) == MARKER})
 
 
+def imajev_settings():
+    return [
+        io.Boolean.Input("debias", default=False, tooltip="Average over up to 4 option orders to cancel position bias. Slower, and changes little in practice."),
+        io.Boolean.Input("calibration", default=True, tooltip="Apply the model's temperature calibration. Changes probabilities, never the answer."),
+    ]
+
+
 class LoadTypedDecisionModel(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -119,18 +126,19 @@ class LoadTypedDecisionModel(io.ComfyNode):
             inputs=[
                 io.Combo.Input("backbone", options=folder_paths.get_filename_list("text_encoders"),
                                tooltip="The LLM in models/text_encoders, e.g. qwen3.5_4b_bf16.safetensors for imajev-4b."),
-                io.Combo.Input("adapter", options=decision_folders(),
-                               tooltip="The model folder in models/typed_decision, e.g. imajev-4b (the Hugging Face repository as downloaded)."),
+                io.DynamicCombo.Input("adapter", options=[io.DynamicCombo.Option(folder, imajev_settings()) for folder in decision_folders()],
+                                      tooltip="The model folder in models/typed_decision, e.g. imajev-4b (the Hugging Face repository as downloaded)."),
             ],
             outputs=[TypedDecisionModel.Output(display_name="typed_decision_model")],
         )
 
     @classmethod
     def execute(cls, backbone, adapter):
-        folder = os.path.dirname(folder_paths.get_full_path_or_raise("typed_decision", os.path.join(adapter, MARKER)))
+        name = adapter["adapter"]
+        folder = os.path.dirname(folder_paths.get_full_path_or_raise("typed_decision", os.path.join(name, MARKER)))
         if not is_imajev(folder):
-            raise ValueError(f"{adapter}: unsupported typed decision model format (expected adapter_config.json, adapter_model.safetensors and decision_readout.*).")
-        return io.NodeOutput(ImajevModel(folder_paths.get_full_path_or_raise("text_encoders", backbone), folder))
+            raise ValueError(f"{name}: unsupported typed decision model format (expected adapter_config.json, adapter_model.safetensors and decision_readout.*).")
+        return io.NodeOutput(ImajevModel(folder_paths.get_full_path_or_raise("text_encoders", backbone), folder, adapter["debias"], adapter["calibration"]))
 
 
 class TypedDecision(io.ComfyNode):
@@ -172,8 +180,6 @@ class TypedDecision(io.ComfyNode):
                                 placeholder="state: the facts to judge against (optional). Plain text or JSON.\ne.g. full body shot of a knight standing in a castle hall",
                                 tooltip="With JSON, instructions can name its fields in `backticks`, e.g. `listing.color`."),
                 io.Float.Input("threshold", default=0.5, min=0.0, max=10.0, step=0.01, tooltip="pass is true when value >= threshold and the model did not abstain."),
-                io.Boolean.Input("debias", default=False, tooltip="Average over up to 4 option orders to cancel position bias. Slower, and changes little in practice."),
-                io.Boolean.Input("calibration", default=True, tooltip="Apply the model's temperature calibration. Changes probabilities, never the answer."),
             ],
             outputs=[
                 io.Float.Output(display_name="value", tooltip="noul: probability the claim is true (0-1). choice: probability of the chosen option (0-1). "
@@ -187,10 +193,10 @@ class TypedDecision(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mode, model, state, threshold, debias, calibration, images=None):
+    def execute(cls, mode, model, state, threshold, images=None):
         slots = sorted((images or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[1]))
         frames = [batch[i] for _, batch in slots if batch is not None for i in range(batch.shape[0])]
         question = question_from_mode(mode)
         check_limits(model, question, len(frames))
-        scores, selected, version = model.decide(frames, parse_state(state), question, debias, calibration)
+        scores, selected, version = model.decide(frames, parse_state(state), question)
         return io.NodeOutput(*answer(question, scores, selected, threshold, version))
