@@ -5,7 +5,7 @@ Follow the engineering rules in the parent ComfyUI `AGENTS.md` (../../AGENTS.md)
 
 ## Scope
 
-This pack runs typed-decision models (noul / choice / score with calibrated probabilities) that ComfyUI's text-encoder inference engine can run: Core's model implementations, loaders and memory management. A new model family is in scope when Core implements its backbone architecture; adding it means a family module next to `imajev.py` (prompt, readout, calibration), not new nodes or inputs. Out of scope: backbones Core does not implement, models that need their own inference code, and remote APIs.
+This pack runs typed-decision models (noul / choice / score with calibrated probabilities) on ComfyUI's text-encoder inference engine: Core's model implementations, loaders and memory management. A new model family is in scope when Core implements its backbone architecture and computes every backbone layer with its own modules. Adding it means a family module next to `imajev.py`: prompt, readout or decision head, calibration, and at most a short loop over Core's blocks when the family needs a different attention mask. Model-specific settings go on the loader under the adapter option; there are no new nodes. Out of scope: backbones Core does not implement, families that change Core's layer math, and remote APIs.
 
 ## Implementation constraints
 
@@ -16,6 +16,14 @@ The nodes reproduce the official imajev torch path (`mohit67890/imajev` @ 523436
 - The decision reads the final-normed hidden state of the last token. `clip_layer` with a negative index is reset by `set_clip_options`, so the node selects `[num_layers]` as a list.
 - PEFT LoRA keys map to `text_encoders.transformer.model.*` with `lora_alpha` supplied as `.alpha`; merged LoRA (the default Core path) matches the unmerged official path, also on the fp8 backbone.
 - Presentation orders (debias) run as one batch with right padding; Core does not pad batch items itself.
+
+d3 reproduces the vllm-sr d3 runtime (`d3-code-readout-v1`; flash @ f6075bf, mini @ 0e78bbd, nano @ 9d9b937, lite @ 3c49f5c). Core computes in fp32 with bf16 weights, so the reference is the official run in fp32. Against it, answers match on the reference cases (text, JSON, empty state, one and two images) and probabilities stay within 0.012 on bf16 and 0.021 on int8 ConvRot (flash, nano and lite measured; mini against bf16 only, within 0.012). Against the official bf16 run, rounding moves a few image cases by up to 0.061 (nano) and flips one borderline score on nano. Keep these when changing code:
+
+- The prompt text is ported verbatim (`d3.render`): system prompt, state as `describe` renders it (`(empty)` when blank), noul listed false then true, score levels as bare options.
+- The full-attention layers are non-causal. `D3Model.hidden` runs Core's blocks with a padding-only mask; Core's own encode is causal and moves probabilities by up to 0.45.
+- Images are resized in the node to the d3 processor's grid (smart_resize, max 1,638,400 px, bicubic + antialias); the patches match the official processor to 1e-7.
+- debias is the runtime's `permutation_average`: choice options also scored in reverse order, probabilities averaged.
+- The readout and `decision_config.json` travel inside the converted backbone file (`d3_readout.weight`, metadata `d3_decision_config`, files on `nomadoor/d3`), because each size's head only fits the backbone it was trained with. The loader offers a fixed `d3` adapter instead of a folder. imajev keeps its folder because its backbone is plain Qwen3.5.
 
 ## Verification
 

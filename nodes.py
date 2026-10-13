@@ -4,7 +4,8 @@ import os
 import folder_paths
 from comfy_api.latest import io
 
-from .imajev import MARKER, ImajevModel, Question, is_imajev
+from . import d3, imajev
+from .imajev import Question
 
 MAX_STATE_BYTES = 131072
 
@@ -19,9 +20,7 @@ def parse_state(text):
         state = json.loads(text)
     except json.JSONDecodeError:
         state = text
-    if isinstance(state, list):
-        state = {"state": state}
-    elif not isinstance(state, dict):
+    if not isinstance(state, (dict, list)):
         state = text
     try:
         size = len(json.dumps(state, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
@@ -75,24 +74,24 @@ def check_limits(model, question, n_images):
         raise ValueError(f"This model accepts at most {model.max_levels} levels; got {len(question.answers)}.")
 
 
-def answer(question, scores, selected, threshold, calibration_version):
-    """Typed Decision outputs from probabilities over answers + unknown (last), in the official Jev answer shape."""
-    unknown = scores[-1]
-    known = scores[:-1]
-    total = sum(known)
-    known = [p / total for p in known] if total > 0 else [1 / len(known)] * len(known)
-    abstained = selected == len(scores) - 1
-    common = {"unknown_probability": unknown, "abstained": abstained}
+def answer(model, question, decision, threshold):
+    """Typed Decision outputs from model.decide, in the model family's official answer shape.
+
+    Models without unknown report unknown as None and never abstain."""
+    scores, unknown, abstained, calibration_version = decision
+    total = sum(scores)
+    known = [p / total for p in scores] if total > 0 else [1 / len(scores)] * len(scores)
+    common = {} if unknown is None else {"unknown_probability": unknown, "abstained": abstained}
     if calibration_version is not None:
         common["calibration_version"] = calibration_version
     if question.kind == "noul":
-        value = scores[0] + 0.5 * unknown
+        value = scores[0] + 0.5 * (unknown or 0.0)
         index = 1 if scores[0] >= scores[1] else 0
         label = "yes" if index else "no"
         result = {"type": "noul", "noul": value, **common}
     else:
         index = max(range(len(known)), key=known.__getitem__)
-        confidence = max(0.0, (len(known) * known[index] - 1) / (len(known) - 1)) * (1 - unknown)  # Jev's concentration
+        confidence = model.confidence(known, unknown)
         if question.kind == "choice":
             value, label = known[index], question.answers[index][0]
             result = {"type": "choice", "choice": label, "probabilities": {v: p for (v, _), p in zip(question.answers, known)},
@@ -105,7 +104,13 @@ def answer(question, scores, selected, threshold, calibration_version):
 
 
 def decision_folders():
-    return sorted({os.path.dirname(f) for f in folder_paths.get_filename_list("typed_decision") if os.path.basename(f) == MARKER})
+    return sorted({os.path.dirname(f) for f in folder_paths.get_filename_list("typed_decision") if os.path.basename(f) == imajev.MARKER} - {"d3"})
+
+
+def adapter_options():
+    """imajev folders in models/typed_decision, then d3, whose head is inside its backbone file."""
+    d3_settings = [io.Boolean.Input("debias", default=False, tooltip="Also score choice options in reverse order and average. Slower.")]
+    return [io.DynamicCombo.Option(folder, imajev_settings()) for folder in decision_folders()] + [io.DynamicCombo.Option("d3", d3_settings)]
 
 
 def imajev_settings():
@@ -122,12 +127,13 @@ class LoadTypedDecisionModel(io.ComfyNode):
             node_id="LoadTypedDecisionModel",
             display_name="Load Typed Decision Model",
             category="typed decision",
-            description="Loads a typed-decision model: an LLM backbone plus the decision adapter trained on it.",
+            description="Loads a typed-decision model: an LLM backbone plus the decision head trained with it (imajev: a folder; d3: inside the backbone file).",
             inputs=[
                 io.Combo.Input("backbone", options=folder_paths.get_filename_list("text_encoders"),
-                               tooltip="The LLM in models/text_encoders, e.g. qwen3.5_4b_bf16.safetensors for imajev-4b."),
-                io.DynamicCombo.Input("adapter", options=[io.DynamicCombo.Option(folder, imajev_settings()) for folder in decision_folders()],
-                                      tooltip="The model folder in models/typed_decision, e.g. imajev-4b (the Hugging Face repository as downloaded)."),
+                               tooltip="The LLM in models/text_encoders: Qwen3.5 for imajev-4b, a d3_*.safetensors file from nomadoor/d3 for d3."),
+                io.DynamicCombo.Input("adapter", options=adapter_options(),
+                                      tooltip="imajev: the model folder in models/typed_decision, e.g. imajev-4b (the Hugging Face repository as downloaded). "
+                                              "d3: pick d3; the backbone file carries the rest."),
             ],
             outputs=[TypedDecisionModel.Output(display_name="typed_decision_model")],
         )
@@ -135,10 +141,13 @@ class LoadTypedDecisionModel(io.ComfyNode):
     @classmethod
     def execute(cls, backbone, adapter):
         name = adapter["adapter"]
-        folder = os.path.dirname(folder_paths.get_full_path_or_raise("typed_decision", os.path.join(name, MARKER)))
-        if not is_imajev(folder):
+        backbone = folder_paths.get_full_path_or_raise("text_encoders", backbone)
+        if name == "d3":
+            return io.NodeOutput(d3.D3Model(backbone, adapter["debias"]))
+        folder = os.path.dirname(folder_paths.get_full_path_or_raise("typed_decision", os.path.join(name, imajev.MARKER)))
+        if not imajev.is_imajev(folder):
             raise ValueError(f"{name}: unsupported typed decision model format (expected adapter_config.json, adapter_model.safetensors and decision_readout.*).")
-        return io.NodeOutput(ImajevModel(folder_paths.get_full_path_or_raise("text_encoders", backbone), folder, adapter["debias"], adapter["calibration"]))
+        return io.NodeOutput(imajev.ImajevModel(backbone, folder, adapter["debias"], adapter["calibration"]))
 
 
 class TypedDecision(io.ComfyNode):
@@ -187,8 +196,8 @@ class TypedDecision(io.ComfyNode):
                 io.String.Output(display_name="label", tooltip="The answer: yes / no, the chosen option, or the most likely level. Not affected by threshold."),
                 io.Int.Output(display_name="index", tooltip="noul: yes = 1, no = 0. choice / score: line number of the answer, from 0."),
                 io.Boolean.Output(display_name="pass", tooltip="True when value >= threshold and the model did not abstain. Use it to branch."),
-                io.Boolean.Output(display_name="abstained", tooltip="True when the images and state are not enough to answer, e.g. to send the case to a person."),
-                io.String.Output(display_name="result", tooltip="Full answer as JSON, in the official Jev shape: every probability, unknown probability, confidence."),
+                io.Boolean.Output(display_name="abstained", tooltip="True when the images and state are not enough to answer, e.g. to send the case to a person. Always false for models without unknown (d3)."),
+                io.String.Output(display_name="result", tooltip="Full answer as JSON, in the model's official answer shape: every probability and confidence (imajev also unknown probability)."),
             ],
         )
 
@@ -198,5 +207,4 @@ class TypedDecision(io.ComfyNode):
         frames = [batch[i] for _, batch in slots if batch is not None for i in range(batch.shape[0])]
         question = question_from_mode(mode)
         check_limits(model, question, len(frames))
-        scores, selected, version = model.decide(frames, parse_state(state), question)
-        return io.NodeOutput(*answer(question, scores, selected, threshold, version))
+        return io.NodeOutput(*answer(model, question, model.decide(frames, parse_state(state), question), threshold))

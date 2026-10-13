@@ -36,6 +36,8 @@ def option_text(kind, value, description):
 
 
 def build_prompt(state, question, labels, offset):
+    if isinstance(state, list):
+        state = {"state": state}
     texts = [option_text(question.kind, v, d) for v, d in question.answers] + [UNKNOWN_TEXT]
     texts = texts[offset:] + texts[:offset]
     header = ("Inspect the available evidence and answer the question using the stated criteria. "
@@ -90,10 +92,10 @@ def downscale(width, height, pixels=PIXELS):
     return (max(1, int(width * scale)), max(1, int(height * scale))) if scale < 1 else (width, height)
 
 
-def grid_size(width, height):
+def grid_size(width, height, max_pixels=MAX_PIXELS):
     h, w = round(height / PATCH) * PATCH, round(width / PATCH) * PATCH
-    if h * w > MAX_PIXELS:
-        beta = math.sqrt(height * width / MAX_PIXELS)
+    if h * w > max_pixels:
+        beta = math.sqrt(height * width / max_pixels)
         h, w = max(PATCH, math.floor(height / beta / PATCH) * PATCH), max(PATCH, math.floor(width / beta / PATCH) * PATCH)
     elif h * w < MIN_PIXELS:
         beta = math.sqrt(MIN_PIXELS / (height * width))
@@ -110,8 +112,13 @@ def prepare_image(image):
     size = downscale(width, height)
     if size != (width, height):
         u8 = torch.from_numpy(np.array(Image.fromarray(u8.numpy()).resize(size, Image.Resampling.LANCZOS)))
+    return fit_grid(u8)
+
+
+def fit_grid(u8, max_pixels=MAX_PIXELS):
+    """[H, W, 3] uint8 -> [1, H', W', 3] float: the Qwen processor's bicubic resize to the patch grid."""
     chw = u8.permute(2, 0, 1)
-    w, h = grid_size(chw.shape[2], chw.shape[1])
+    w, h = grid_size(chw.shape[2], chw.shape[1], max_pixels)
     if (w, h) != (chw.shape[2], chw.shape[1]):
         chw = TF.resize(chw, [h, w], interpolation=TF.InterpolationMode.BICUBIC, antialias=True)
     return (chw.permute(1, 2, 0).float() / 255.0).unsqueeze(0)
@@ -190,6 +197,11 @@ class ImajevModel:
         self.tokenizer = tokenizer
 
     @staticmethod
+    def confidence(known, unknown):
+        """Jev's concentration of the known answers, scaled by the share that is not unknown."""
+        return max(0.0, (len(known) * max(known) - 1) / (len(known) - 1)) * (1 - unknown)
+
+    @staticmethod
     def _load_calibration(folder):
         for name in CALIBRATION_FILES:
             path = os.path.join(folder, name)
@@ -202,7 +214,7 @@ class ImajevModel:
         return None
 
     def decide(self, images, state, question):
-        """-> (probabilities over answers + unknown, selected index, calibration version or None)."""
+        """-> (probabilities over answers, unknown probability, abstained, calibration version or None)."""
         images = [prepare_image(image) for image in images]
         n = len(question.answers) + 1
         labels = [code for code, _ in self.codes[:n]]
@@ -234,6 +246,7 @@ class ImajevModel:
             selected = max(range(n), key=logits.__getitem__)
         t, version = None, None
         if self.calibration is not None:
-            t = temperature(self.calibration, question.kind, n - 1, photo_only=bool(images) and not state)
+            t = temperature(self.calibration, question.kind, n - 1, photo_only=bool(images) and state == {})
             version = self.calibration.get("calibration_version") if t is not None else None
-        return softmax(logits, t or 1.0), selected, version
+        scores = softmax(logits, t or 1.0)
+        return scores[:-1], scores[-1], selected == n - 1, version
