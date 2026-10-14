@@ -4,6 +4,7 @@ import math
 import shutil
 import subprocess
 import types
+from fractions import Fraction
 
 import av
 import numpy as np
@@ -14,8 +15,9 @@ import torch
 import comfy.model_management
 import comfy.text_encoders.qwen35
 import folder_paths
-from comfy_api.latest import InputImpl, io
-from typed_decision import clef, d3, frames, imajev, region
+from comfy_api.latest import InputImpl, Types, io
+from typed_decision import clef, d3, frames, imajev, interval, nodes, region
+from comfy_execution.graph_utils import ExecutionBlocker
 from typed_decision.imajev import (MAX_BATCH_TOKENS, ImajevModel, Question, batches, memory_estimation, token_budget, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
                     render, rotation_offsets, select, temperature, tokenize)
 from typed_decision.nodes import (LoadTypedDecisionModel, TypedDecision, answer, check_limits, parse_levels, parse_options, parse_state,
@@ -598,8 +600,6 @@ def test_frames_take_in_memory_videos_by_index():
 
 
 def types_video_components(images):
-    from fractions import Fraction
-    from comfy_api.latest import Types
     return Types.VideoComponents(images=images, frame_rate=Fraction(2))
 
 
@@ -700,3 +700,137 @@ def test_decision_node_reports_the_video_frames_it_read():
     video = InputImpl.VideoFromComponents(types_video_components(torch.zeros(31, 8, 8, 3)))
     out = TypedDecision.execute({"mode": "noul", "instructions": "It moves."}, Model(), "", 0.5, None, {"video_0": video})
     assert json.loads(out.result[5])["videos"] == [{"frames": 3, "interval": 0.5}]
+
+
+def test_interval_reads_the_video_at_2_fps():
+    assert interval.sample(20, 10.0) == [0, 6, 13, 19]
+    assert interval.sample(3, 30.0) == [0]  # a clip shorter than one sample still gives a frame
+    assert interval.sample(4, 1.0) == [0, 1, 2, 3]  # never more than the video has
+
+
+def test_interval_windows_cover_every_sample_at_half_a_window_apart():
+    assert interval.windows(10, 4) == [(0, 4), (2, 6), (4, 8), (6, 10)]
+    assert interval.windows(9, 4) == [(0, 4), (2, 6), (4, 8), (5, 9)]  # the last window ends on the last sample
+    assert interval.windows(3, 8) == [(0, 3)]
+    assert interval.windows(3, 1) == [(0, 1), (1, 2), (2, 3)]
+
+
+def test_interval_runs_of_passing_windows():
+    assert interval.runs([True, True, False, False, True]) == [(0, 1), (4, 4)]
+    assert interval.runs([False, False]) == []
+
+
+def test_interval_edge_searches_slide_a_window_between_the_failing_and_the_passing_one():
+    indices = [0, 5, 10, 15, 20, 25]  # samples of a 30-frame clip
+    spans = interval.windows(6, 2)  # (0, 2) (1, 3) (2, 4) (3, 5) (4, 6)
+    # windows 2..3 pass: the start slides window 1 (frames 5, 10) towards window 2, 5 frames on; the end slides window 3
+    # (frames 15, 20) towards window 4, 5 frames on
+    assert interval.searches(spans, 2, 3, indices, 30) == [([5, 10], 5, 0, False), ([15, 20], 0, 5, True)]
+    # at the ends of the video the window slides out of it, where it sees nothing
+    assert interval.searches(spans, 0, 4, indices, 30) == [([0, 5], 0, -6, False), ([20, 25], 0, 10, True)]
+
+
+def test_interval_slides_each_window_to_where_it_starts_to_pass():
+    hits = set(range(13, 31))
+    judge = lambda windows: [any(f in hits for f in w) for w in windows]
+    # the start: [5, 10] sees nothing, [10, 15] sees 13; the end: [20, 25] sees 20, [35, 40] sees nothing
+    assert interval.slide([([5, 10], 5, 0, False), ([20, 25], 0, 15, True)], 50, judge) == [3, 10]
+
+
+def test_interval_edges_are_exact_where_the_samples_are_uneven():
+    indices = interval.sample(600, 24.0)  # rounded, so 11 or 12 frames apart
+    spans = interval.windows(len(indices), 8)
+    hits = set(range(330, 378))
+    judge = lambda windows: [any(f in hits for f in w) for w in windows]
+    (first, last), = interval.runs(judge([indices[s:e] for s, e in spans]))
+    wanted = interval.searches(spans, first, last, indices, 600)
+    assert [interval.edge(w, d) for w, d in zip(wanted, interval.slide(wanted, 600, judge))] == [330, 378]
+
+
+def test_interval_slides_leave_out_frames_outside_the_video():
+    seen = []
+    judge = lambda windows: seen.extend(windows) or [True] * len(windows)
+    assert interval.slide([([0, 5], 0, -6, False), ([20, 25], 0, 10, True)], 30, judge) == [-5, 9]
+    assert all(0 <= f < 30 for w in seen for f in w) and [] not in seen
+
+
+def test_interval_edge_is_where_the_far_frame_of_the_window_meets_it():
+    # a window passes once one frame shows what is asked: the start is its last frame, the end after its first
+    assert interval.edge(([5, 10], 5, 0, False), 3) == 13 and interval.edge(([20, 25], 0, 15, True), 10) == 31
+
+
+class IntervalModel:
+    """Says yes when any frame it sees has a brightness in `hits` (frame i of interval_video has brightness i / 100)."""
+    max_images, max_options, max_levels = 4, 255, 10
+    confidence = staticmethod(lambda known, unknown: 0.0)
+
+    def __init__(self, max_videos, hits):
+        self.max_videos, self.hits, self.requests = max_videos, hits, []
+
+    def decide_many(self, requests):
+        self.requests += requests
+        out = []
+        for images, videos, _, _ in requests:
+            seen = videos[0].frames.float() / 255 if videos else torch.stack(images)
+            hit = any(round(float(frame.mean()) * 100) in self.hits for frame in seen)
+            out.append(([0.9, 0.1] if hit else [0.1, 0.9], None, False, None))
+        return out
+
+
+def interval_video(n=60):
+    """n frames at 10 fps; frame i has brightness i / 100 so the fake model can tell them apart."""
+    images = torch.arange(n).float().div(100).view(n, 1, 1, 1).expand(n, 64, 64, 3).contiguous()  # large enough to encode when trimmed
+    return InputImpl.VideoFromComponents(Types.VideoComponents(images=images, frame_rate=Fraction(10)))
+
+
+def search(model, video, window=2, threshold=0.5):
+    return interval.IntervalSearch.execute(model=model, video=video, instructions="It moves.", state="", window=window, threshold=threshold).result
+
+
+@pytest.mark.parametrize("max_videos", [math.inf, 0])
+def test_interval_node_finds_each_interval_to_the_source_frame(max_videos):
+    model = IntervalModel(max_videos, hits=set(range(20, 34)))
+    intervals, videos = search(model, interval_video())
+    assert json.loads(intervals) == [{"start": 2.0, "end": 3.4, "start_frame": 20, "end_frame": 34, "score": pytest.approx(0.9)}]
+    assert len(videos) == 1 and videos[0].get_components().images.shape[0] == 14
+    if max_videos:
+        # 12 samples over 59 source frames; the edges slide the same windows, so they are read at the same rate
+        assert [r[1][0].fps for r in model.requests] == [pytest.approx(10 * 11 / 59)] * len(model.requests)
+
+
+def test_interval_node_trims_an_interval_that_reaches_the_end():
+    intervals, videos = search(IntervalModel(math.inf, hits=set(range(40, 60))), interval_video())
+    assert json.loads(intervals)[-1]["end_frame"] == 60
+    assert videos[-1] is not None and videos[-1].get_components().images.shape[0] == 20
+
+
+def test_interval_node_keeps_the_trim_end_of_a_trimmed_file(tmp_path):
+    path = tmp_path / "clip.mp4"
+    write_clip(path, "libx264")  # 23 frames at 6 fps
+    video = InputImpl.VideoFromFile(str(path)).as_trimmed(0.4, 1.6)
+    total = frames.frame_count(video)
+    model = IntervalModel(math.inf, hits=set(range(101)))  # every frame passes
+    intervals, videos = search(model, video)
+    assert json.loads(intervals)[-1]["end_frame"] == total
+    assert videos[-1].get_components().images.shape[0] == total
+
+
+def test_interval_node_blocks_video_nodes_when_nothing_is_found():
+    intervals, videos = search(IntervalModel(math.inf, hits=set()), interval_video())
+    assert json.loads(intervals) == [] and len(videos) == 1 and isinstance(videos[0], ExecutionBlocker)
+
+
+def test_interval_node_asks_noul_only():
+    inputs = schema_inputs(interval.IntervalSearch)
+    # in Typed Decision's order: the question, the model, the media, the state
+    assert list(inputs) == ["instructions", "criteria_true", "criteria_false", "model", "video", "state", "window", "threshold"]
+    assert [i.as_dict() for i in inputs.values()][:3] == [i.as_dict() for i in nodes.noul_inputs()]
+
+
+def test_d3_reads_every_frame_of_a_clip_as_its_own_group():
+    model = d3.D3Model.__new__(d3.D3Model)
+    model.fps = 0.5  # a VIDEO of 3 frames at 2 fps would be thinned and paired
+    clip = frames.Clip(torch.arange(3, dtype=torch.uint8).view(3, 1, 1, 1).expand(3, 64, 64, 3), 2.0)
+    video, times = model.prepare_video(clip)
+    assert times == [0.0, 0.5, 1.0]  # one group a frame: d3 barely sees the second frame of a pair
+    assert video.shape[0] == 6 and (video[:, 0, 0, 0] * 255).round().tolist() == [0, 0, 1, 1, 2, 2]

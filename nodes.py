@@ -126,16 +126,20 @@ def imajev_settings():
     ]
 
 
+def noul_inputs():
+    return [
+        io.String.Input("instructions", multiline=True, default="",
+                        placeholder="instructions: a claim to judge true or false, or a yes/no question.\ne.g. Many people are in the image."),
+        io.String.Input("criteria_true", multiline=True, default="", optional=True,
+                        placeholder="criteria_true (optional): when the answer is yes.\ne.g. five or more people are visible"),
+        io.String.Input("criteria_false", multiline=True, default="", optional=True,
+                        placeholder="criteria_false (optional): when the answer is no.\ne.g. four or fewer people are visible"),
+    ]
+
+
 def mode_input():
     return io.DynamicCombo.Input("mode", options=[
-        io.DynamicCombo.Option("noul", [
-            io.String.Input("instructions", multiline=True, default="",
-                            placeholder="instructions: a claim to judge true or false, or a yes/no question.\ne.g. Many people are in the image."),
-            io.String.Input("criteria_true", multiline=True, default="", optional=True,
-                            placeholder="criteria_true (optional): when the answer is yes.\ne.g. five or more people are visible"),
-            io.String.Input("criteria_false", multiline=True, default="", optional=True,
-                            placeholder="criteria_false (optional): when the answer is no.\ne.g. four or fewer people are visible"),
-        ]),
+        io.DynamicCombo.Option("noul", noul_inputs()),
         io.DynamicCombo.Option("choice", [
             io.String.Input("instructions", multiline=True, default="",
                             placeholder="instructions: the question to answer.\ne.g. What is the main subject of the image?"),

@@ -93,6 +93,20 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 | `bboxes` | Per image, one box around each group of touching positive tiles; `score` is the highest `value` in the group |
 | `heatmap` | The `value` of the deepest tile judged at each pixel (white = 1; score: the last level) |
 
+**Typed Decision Interval Search**: finds when in a video something one frame can show holds, such as "A dog is visible." It reads the whole video at 2 fps (the rate d3 is trained on) and judges windows of `window` frames, half a window apart; a window passes once one of its frames shows it. It then finds each edge to the source frame by sliding the window one source frame at a time.
+
+- `instructions`, `criteria_true`, `criteria_false`, `state`: as noul in Typed Decision.
+- `window`: frames judged together (default 8, 4 seconds). imajev takes at most 2.
+- The intervals follow the model's answer on single frames: an object half out of the frame may already count as gone. Write the question for what you want to count.
+- Motion, such as which way something moves, is not searched for: a window passes on part of it, and how much depends on the video, so its edges cannot be found.
+- An event shorter than half a second can fall between the 2 fps samples and be missed; when it is found, its edges are rough.
+- d3 sees each frame twice, as a group of its own: it barely sees the second frame of a pair. Clef-flash sees the frames as images. Both see them at d3's video frame size (about 200,000 px a frame).
+
+| Output | Meaning |
+| --- | --- |
+| `intervals` | JSON list of `start`, `end` (seconds), `start_frame`, `end_frame` (source frames, end exclusive) and `score` (highest window probability) |
+| `videos` | The video trimmed to each interval. When nothing is found, the video nodes after it are skipped. |
+
 ## Sample workflows
 
 - [noul](example_workflows/typed_decision_noul.json): are many people in the image?

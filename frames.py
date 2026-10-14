@@ -2,11 +2,19 @@
 
 A file is decoded once from the start of its trim window, and only the requested frames (by index, as the d3 runtime
 picks them) are kept. Other videos, and files with a crop that cannot be read back, go through get_components."""
+from typing import NamedTuple
+
 import av
 import numpy as np
 import torch
 
 from comfy_api.latest import InputImpl
+
+
+class Clip(NamedTuple):
+    """Frames already read ([T, H, W, 3] uint8), `fps` per second. A model sees each of them and does not thin them again."""
+    frames: torch.Tensor
+    fps: float
 
 
 def streamed(video):

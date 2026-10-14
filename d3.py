@@ -105,6 +105,14 @@ def video_size(width, height, n_frames):
     return grid_size(width, height, VIDEO_MAX_PIXELS, VIDEO_MIN_PIXELS / n_frames)
 
 
+def resize_frame(frame, n_frames):
+    """[H, W, 3] uint8 -> the size the video processor gives a frame of an n_frames video."""
+    w, h = video_size(frame.shape[1], frame.shape[0], n_frames)
+    if (w, h) == (frame.shape[1], frame.shape[0]):
+        return frame
+    return TF.resize(frame.permute(2, 0, 1), [h, w], interpolation=TF.InterpolationMode.BICUBIC, antialias=True).permute(1, 2, 0)
+
+
 def video_patches(frames):
     """[T, 3, H, W] in 0..1 -> flattened patches in the processor's layout, for a grid of (T / 2, H / 16, W / 16)."""
     t, c, h, w = frames.shape
@@ -164,16 +172,18 @@ class D3Model:
         return sample_indices(total, fps, self.fps), fps
 
     def prepare_video(self, video):
-        """VIDEO -> (frames [T, 3, H', W'] in 0..1 with an even T, group timestamps), as the runtime reads a video file."""
-        indices, fps = self.video_plan(video)
-        padded = len(indices) + len(indices) % 2  # the last frame repeats to make pairs
+        """VIDEO -> (frames [T, 3, H', W'] in 0..1 with an even T, group timestamps), as the runtime reads a video file.
 
-        def resize(frame):  # each frame is resized on its own as it is read, so the clip is never held at full size
-            w, h = video_size(frame.shape[1], frame.shape[0], padded)
-            if (w, h) == (frame.shape[1], frame.shape[0]):
-                return frame
-            return TF.resize(frame.permute(2, 0, 1), [h, w], interpolation=TF.InterpolationMode.BICUBIC, antialias=True).permute(1, 2, 0)
-        u8 = frames.read_frames(video, indices, resize).permute(0, 3, 1, 2)
+        A frames.Clip is read whole, each frame twice so it fills a group of its own: d3 barely sees the second frame of a
+        pair, and a search must not miss what shows on one frame only."""
+        if isinstance(video, frames.Clip):
+            indices, fps = [i for i in range(video.frames.shape[0]) for _ in range(2)], video.fps
+            u8 = torch.stack([resize_frame(frame, len(indices)) for frame in video.frames]).repeat_interleave(2, dim=0).permute(0, 3, 1, 2)
+        else:
+            indices, fps = self.video_plan(video)
+            padded = len(indices) + len(indices) % 2  # the last frame repeats to make pairs
+            # each frame is resized on its own as it is read, so the clip is never held at full size
+            u8 = frames.read_frames(video, indices, lambda frame: resize_frame(frame, padded)).permute(0, 3, 1, 2)
         if len(indices) % 2:
             u8 = torch.cat([u8, u8[-1:]])
         return u8.float() / 255.0, timestamps(indices, fps)
