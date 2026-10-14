@@ -4,7 +4,7 @@ import os
 import folder_paths
 from comfy_api.latest import io
 
-from . import d3, imajev
+from . import clef, d3, imajev
 from .imajev import Question
 
 MAX_STATE_BYTES = 131072
@@ -104,13 +104,14 @@ def answer(model, question, decision, threshold):
 
 
 def decision_folders():
-    return sorted({os.path.dirname(f) for f in folder_paths.get_filename_list("typed_decision") if os.path.basename(f) == imajev.MARKER} - {"d3"})
+    return sorted({os.path.dirname(f) for f in folder_paths.get_filename_list("typed_decision") if os.path.basename(f) == imajev.MARKER} - {"d3", "clef"})
 
 
 def adapter_options():
-    """imajev folders in models/typed_decision, then d3, whose head is inside its backbone file."""
+    """imajev folders in models/typed_decision, then d3 and clef, whose heads are inside their backbone files."""
     d3_settings = [io.Boolean.Input("debias", default=False, tooltip="Also score choice options in reverse order and average. Slower.")]
-    return [io.DynamicCombo.Option(folder, imajev_settings()) for folder in decision_folders()] + [io.DynamicCombo.Option("d3", d3_settings)]
+    return ([io.DynamicCombo.Option(folder, imajev_settings()) for folder in decision_folders()]
+            + [io.DynamicCombo.Option("d3", d3_settings), io.DynamicCombo.Option("clef", [])])
 
 
 def imajev_settings():
@@ -127,13 +128,13 @@ class LoadTypedDecisionModel(io.ComfyNode):
             node_id="LoadTypedDecisionModel",
             display_name="Load Typed Decision Model",
             category="typed decision",
-            description="Loads a typed-decision model: an LLM backbone plus the decision head trained with it (imajev: a folder; d3: inside the backbone file).",
+            description="Loads a typed-decision model: an LLM backbone plus the decision head trained with it (imajev: a folder; d3 and clef: inside the backbone file).",
             inputs=[
                 io.Combo.Input("backbone", options=folder_paths.get_filename_list("text_encoders"),
-                               tooltip="The LLM in models/text_encoders: Qwen3.5 for imajev-4b, a d3_*.safetensors file from nomadoor/d3 for d3."),
+                               tooltip="The LLM in models/text_encoders: Qwen3.5 for imajev-4b, a d3_*.safetensors file from nomadoor/d3 for d3, a clef_*.safetensors file from nomadoor/clef for clef."),
                 io.DynamicCombo.Input("adapter", options=adapter_options(),
                                       tooltip="imajev: the model folder in models/typed_decision, e.g. imajev-4b (the Hugging Face repository as downloaded). "
-                                              "d3: pick d3; the backbone file carries the rest."),
+                                              "d3 / clef: pick d3 or clef; the backbone file carries the rest."),
             ],
             outputs=[TypedDecisionModel.Output(display_name="typed_decision_model")],
         )
@@ -144,6 +145,8 @@ class LoadTypedDecisionModel(io.ComfyNode):
         backbone = folder_paths.get_full_path_or_raise("text_encoders", backbone)
         if name == "d3":
             return io.NodeOutput(d3.D3Model(backbone, adapter["debias"]))
+        if name == "clef":
+            return io.NodeOutput(clef.ClefModel(backbone))
         folder = os.path.dirname(folder_paths.get_full_path_or_raise("typed_decision", os.path.join(name, imajev.MARKER)))
         if not imajev.is_imajev(folder):
             raise ValueError(f"{name}: unsupported typed decision model format (expected adapter_config.json, adapter_model.safetensors and decision_readout.*).")

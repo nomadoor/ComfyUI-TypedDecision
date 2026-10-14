@@ -6,7 +6,7 @@ Custom nodes for Jev-style typed decisions: a multimodal LLM does not write text
 - **choice**: one of your options
 - **score**: a position on your ordered levels
 
-Several local alternatives to Jev exist. ComfyUI already has its own multimodal LLM inference engine, so this pack reuses it. Supported models: [imajev](https://github.com/mohit67890/imajev) and [d3 (Decision 3.0)](https://huggingface.co/vllm-sr/d3-flash).
+Several local alternatives to Jev exist. ComfyUI already has its own multimodal LLM inference engine, so this pack reuses it. Supported models: [imajev](https://github.com/mohit67890/imajev), [d3 (Decision 3.0)](https://huggingface.co/vllm-sr/d3-flash) and [Clef-flash](https://huggingface.co/Cloudflare/clef-flash).
 
 More details on the blog: [日本語](https://comfyui.nomadoor.net/ja/notes/typed-decision/) · [English](https://comfyui.nomadoor.net/en/notes/typed-decision/) · [中文](https://comfyui.nomadoor.net/zh/notes/typed-decision/)
 
@@ -48,9 +48,15 @@ d3 is a full fine-tune, so it does not use plain Qwen3.5. Each file below is the
 - [d3_nano_int8_convrot.safetensors](https://huggingface.co/nomadoor/d3/blob/main/text_encoders/d3_nano_int8_convrot.safetensors) (3.06 GB) or [d3_nano_bf16.safetensors](https://huggingface.co/nomadoor/d3/blob/main/text_encoders/d3_nano_bf16.safetensors) (4.43 GB)
 - [d3_lite_int8_convrot.safetensors](https://huggingface.co/nomadoor/d3/blob/main/text_encoders/d3_lite_int8_convrot.safetensors) (1.21 GB) or [d3_lite_bf16.safetensors](https://huggingface.co/nomadoor/d3/blob/main/text_encoders/d3_lite_bf16.safetensors) (1.71 GB)
 
+### Clef-flash
+
+Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Each file below is the whole model, head included; download one and put it in `text_encoders`.
+
+- [clef_flash_int8_convrot.safetensors](https://huggingface.co/nomadoor/clef/blob/main/text_encoders/clef_flash_int8_convrot.safetensors) (12.2 GB) or [clef_flash_bf16.safetensors](https://huggingface.co/nomadoor/clef/blob/main/text_encoders/clef_flash_bf16.safetensors) (19.1 GB)
+
 ## Nodes
 
-**Load Typed Decision Model**: for imajev, pick Qwen3.5 as `backbone` and imajev-4b as `adapter`. For d3, pick a d3 file as `backbone` and `d3` as `adapter`. The model's own settings appear under `adapter`:
+**Load Typed Decision Model**: for imajev, pick Qwen3.5 as `backbone` and imajev-4b as `adapter`. For d3 and Clef-flash, pick the model file as `backbone` and `d3` or `clef` as `adapter`. The model's own settings appear under `adapter`:
 
 - `debias`: average over several option orders (slower). d3 also scores choice options in reverse order.
 - `calibration` (imajev): apply the model's temperature calibration
@@ -59,7 +65,7 @@ d3 is a full fine-tune, so it does not use plain Qwen3.5. Each file below is the
 
 - `mode`: `noul`, `choice` or `score`
 - `instructions` / `criteria`: the question, and the options or levels, one per line. noul takes optional `criteria_true` / `criteria_false` for when to answer yes or no.
-- `images`: imajev takes up to 2 (with two, the first is the reference and the second is the one to judge); d3 takes any number.
+- `images`: imajev takes up to 2 (with two, the first is the reference and the second is the one to judge); d3 and Clef-flash take any number.
 - `state`: optional facts to judge against, as text or JSON
 
 | Output | Meaning |
@@ -68,7 +74,7 @@ d3 is a full fine-tune, so it does not use plain Qwen3.5. Each file below is the
 | `label` | The answer. Not affected by `threshold`. |
 | `index` | noul: yes = 1<br>choice, score: line number of the answer, from 0 |
 | `pass` | `value` >= `threshold` and the model did not abstain |
-| `abstained` | The images and state were not enough to answer (imajev; always false for d3) |
+| `abstained` | The images and state were not enough to answer (imajev; always false for d3 and Clef-flash) |
 | `result` | Full answer as JSON |
 
 ## Sample workflows
@@ -84,4 +90,5 @@ d3 is a full fine-tune, so it does not use plain Qwen3.5. Each file below is the
 
 - [imajev](https://github.com/mohit67890/imajev) and [imajev-4b](https://huggingface.co/mohit67890/imajev-4b) by mohit67890: the model, prompt format and scoring this pack reproduces
 - [d3 (Decision 3.0)](https://huggingface.co/vllm-sr/d3-flash) by the vLLM Semantic Router team: the d3 models, prompt format and readout this pack reproduces
+- [Clef-flash](https://huggingface.co/Cloudflare/clef-flash) by Cloudflare: the model, prompt format and joint schema head this pack reproduces
 - [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-4B) by the Qwen team, repackaged for ComfyUI by [Comfy-Org](https://huggingface.co/Comfy-Org/Qwen3.5)

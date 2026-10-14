@@ -25,6 +25,13 @@ d3 reproduces the vllm-sr d3 runtime (`d3-code-readout-v1`; flash @ f6075bf, min
 - debias is the runtime's `permutation_average`: choice options also scored in reverse order, probabilities averaged.
 - The readout and `decision_config.json` travel inside the converted backbone file (`d3_readout.weight`, metadata `d3_decision_config`, files on `nomadoor/d3`), because each size's head only fits the backbone it was trained with. The loader offers a fixed `d3` adapter instead of a folder. imajev keeps its folder because its backbone is plain Qwen3.5.
 
+Clef reproduces Cloudflare's `joint_schema_model.py` (clef-flash @ 8b2e5fd), one question per record with the field ID `decision`. Against the official fp32 run, answers match on the 16 reference questions (text, JSON, empty state, one and two images) and probabilities stay within 0.003 on bf16 and 0.015 on int8 ConvRot. Keep these when changing code:
+
+- The prompt is tokenized piece by piece exactly as `encode_record` does (`clef.encode`); tokenizing the joined text gives different ids. Choice options are listed sorted by id and mapped back; blank state (and a typed `{}`) renders as an empty string. The state is cut to the release's 16,384-token limit; where the release refuses (question, options and images alone over the limit), the node drops the state and runs.
+- The head reads the final-normed hidden states of every token (Core's causal encode, `clip_layer([num_layers])`) and the `lm_head` rows of each option's tokens. `lm_head` stays bf16 in the int8 file: an int8 ConvRot `lm_head` gives a max diff of 0.0151 against official fp32 (0.0147 with bf16) but would need a quantized row gather. The head (118M parameters) keeps the release's torch modules (`MultiheadAttention`, `TransformerDecoderLayer`) for exact parity and runs in fp32 under its own ModelPatcher, fully loaded.
+- Images are resized like the release processor (smart_resize, bicubic + antialias) but capped at 1,638,400 px as d3, not the release's 16,777,216 px; larger images are read smaller on purpose.
+- The head (`clef_head.*`) and `joint_head_config.json` (metadata `clef_head_config`) travel inside the converted backbone file on `nomadoor/clef`; the loader offers a fixed `clef` adapter.
+
 ## Verification
 
 From the ComfyUI root (the pack's `__init__.py` uses relative imports, so pytest must use importlib mode):

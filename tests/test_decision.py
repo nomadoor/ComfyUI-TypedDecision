@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 
@@ -8,7 +9,7 @@ import torch
 import comfy.text_encoders.qwen35
 import folder_paths
 from comfy_api.latest import io
-from typed_decision import d3
+from typed_decision import clef, d3
 from typed_decision.imajev import (ImajevModel, Question, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
                     render, rotation_offsets, select, temperature, tokenize)
 from typed_decision.nodes import (LoadTypedDecisionModel, TypedDecision, answer, check_limits, parse_levels, parse_options, parse_state,
@@ -214,7 +215,7 @@ def test_load_node_offers_each_model_folder_with_its_settings(monkeypatch):
     adapter = schema_inputs(LoadTypedDecisionModel)["adapter"]
     assert isinstance(adapter, io.DynamicCombo.Input)
     settings = {o.key: {i.id: i.default for i in o.inputs} for o in adapter.options}
-    assert settings == {"imajev-4b": {"debias": False, "calibration": True}, "d3": {"debias": False}}
+    assert settings == {"imajev-4b": {"debias": False, "calibration": True}, "d3": {"debias": False}, "clef": {}}
 
 
 def test_decision_node_keeps_only_question_inputs():
@@ -306,3 +307,81 @@ def test_d3_limits():
     with pytest.raises(ValueError):
         check_limits(d3.D3Model, Question("score", "Q", [(i, str(i)) for i in range(11)]), 0)
     check_limits(d3.D3Model, Question("choice", "Q", [(str(i), None) for i in range(255)]), 5)
+
+
+CLEF_CASES = [  # official encode_record: length, question span, option spans, option ids
+    ({"ticket": "charged twice"}, Question("choice", "Which department?", [("sales", None), ("billing", "Payments")]),
+     124, (66, 69), [(80, 90), (96, 102)], [1, 0], "66509e4e164b6c2f"),
+    ({}, Question("noul", "It is red.", [(True, None), (False, "it is blue")]), 134, (61, 65), [(76, 94), (100, 112)], [0, 1],
+     "f16a462c351958ac"),
+    ("s", Question("score", "Urgency?", [(0, "low"), (1, "high: now")]), 126, (61, 65), [(76, 86), (92, 104)], [0, 1],
+     "b6aa8a4b72f03361"),
+]
+
+
+@pytest.mark.parametrize("state, question, length, question_span, option_spans, order, digest", CLEF_CASES)
+def test_clef_encoding_matches_official_pieces(state, question, length, question_span, option_spans, order, digest):
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    tokens, spans, got_order, option_ids = clef.encode(hf, state, question, [])
+    assert len(tokens) == length and spans == (question_span, option_spans) and got_order == order
+    assert hashlib.sha256(str(tokens).encode()).hexdigest()[:16] == digest
+    assert option_ids == [tokens[a:b] for a, b in option_spans]
+    text = hf.decode(tokens)
+    assert text.startswith("<|im_start|>system\n" + clef.SYSTEM_PROMPT + "<|im_end|>\n<|im_start|>user\nSTATE:\n")
+    assert text.endswith("END FIELD\n\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
+
+
+def test_clef_images_go_after_state_header_and_shift_spans():
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    state, question, length, question_span, option_spans, order, _ = CLEF_CASES[0]
+    image = torch.zeros(1, 64, 96, 3)  # 2 x 3 patches of 32 px
+    tokens, spans, _, _ = clef.encode(hf, state, question, [image])
+    shift = 6 + 3  # vision_start, 6 image tokens, vision_end, newline, minus the placeholder itself
+    assert spans == ((question_span[0] + shift, question_span[1] + shift), [(a + shift, b + shift) for a, b in option_spans])
+    header = hf("<|im_start|>system\n" + clef.SYSTEM_PROMPT + "<|im_end|>\n<|im_start|>user\nSTATE:\n", add_special_tokens=False)["input_ids"]
+    at = len(header)
+    assert tokens[:at] == header and [t if not isinstance(t, dict) else "IMG" for t in tokens[at:at + 4]] == [
+        hf.convert_tokens_to_ids("<|vision_start|>"), "IMG", hf.convert_tokens_to_ids("<|vision_end|>"), hf("\n")["input_ids"][0]]
+
+
+def test_clef_long_state_is_cut_to_the_release_limit():
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    tokens, spans, _, option_ids = clef.encode(hf, "word " * 20000, CLEF_CASES[0][1], [torch.zeros(1, 64, 96, 3)])
+    assert len(tokens) - 1 + 6 == clef.MAX_LENGTH  # the image placeholder counts as its 6 tokens
+    assert [hf.decode(ids) for ids in option_ids] == ['{"description":"Payments","option_id":"billing"}', '{"option_id":"sales"}']
+
+
+def test_clef_drops_the_state_instead_of_failing_when_images_fill_the_limit(monkeypatch):
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    monkeypatch.setattr(clef, "MAX_LENGTH", 50)
+    tokens, _, _, _ = clef.encode(hf, "some state", CLEF_CASES[0][1], [torch.zeros(1, 64, 96, 3)])
+    assert "some state" not in hf.decode([t for t in tokens if not isinstance(t, dict)])
+
+
+def test_clef_probabilities_return_to_question_order():
+    assert clef.restore([1, 0], [0.75, 0.25]) == [0.25, 0.75]
+
+
+def test_clef_head_is_read_from_the_backbone_file(tmp_path):
+    path = str(tmp_path / "clef.safetensors")
+    head = {clef.HEAD + "joint_logit_scale": torch.zeros(()), "model.language_model.norm.weight": torch.ones(4)}
+    safetensors.torch.save_file(head, path, metadata={clef.CONFIG: json.dumps({"hidden_size": 4})})
+    weights, config = clef.read_head(path)
+    assert list(weights) == ["joint_logit_scale"] and config == {"hidden_size": 4}
+    plain = str(tmp_path / "qwen.safetensors")
+    safetensors.torch.save_file({"model.language_model.norm.weight": torch.ones(4)}, plain)
+    with pytest.raises(ValueError, match="nomadoor/clef"):
+        clef.read_head(plain)
+
+
+def test_clef_answer_has_no_unknown():
+    q = Question("choice", "Q", [("a", None), ("b", None)])
+    value, label, index, passed, abstained, result = answer(clef.ClefModel, q, ([0.25, 0.75], None, False, None), threshold=0.5)
+    assert label == "b" and value == 0.75 and passed and not abstained
+    assert json.loads(result) == {"type": "choice", "choice": "b", "probabilities": {"a": 0.25, "b": 0.75}, "confidence": 0.75}
+
+
+def test_clef_image_grid_uses_the_pixel_budget():
+    out = clef.prepare_image(torch.rand(4400, 4000, 3))
+    _, h, w, _ = out.shape
+    assert h * w <= clef.MAX_PIXELS and (w, h) == grid_size(4000, 4400, clef.MAX_PIXELS)
