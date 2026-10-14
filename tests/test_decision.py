@@ -10,7 +10,7 @@ import comfy.text_encoders.qwen35
 import folder_paths
 from comfy_api.latest import io
 from typed_decision import clef, d3
-from typed_decision.imajev import (ImajevModel, Question, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
+from typed_decision.imajev import (ImajevModel, Question, batches, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
                     render, rotation_offsets, select, temperature, tokenize)
 from typed_decision.nodes import (LoadTypedDecisionModel, TypedDecision, answer, check_limits, parse_levels, parse_options, parse_state,
                                   question_from_mode)
@@ -385,3 +385,28 @@ def test_clef_image_grid_uses_the_pixel_budget():
     out = clef.prepare_image(torch.rand(4400, 4000, 3))
     _, h, w, _ = out.shape
     assert h * w <= clef.MAX_PIXELS and (w, h) == grid_size(4000, 4400, clef.MAX_PIXELS)
+
+
+def test_batches_share_one_media_layout_and_a_token_budget():
+    layouts = [((32, 32),), ((32, 32),), ((64, 32),), ((32, 32),), ()]
+    lengths = [100, 120, 100, 300, 50]
+    assert batches(layouts, lengths, budget=1000) == [[0, 1, 3], [2], [4]]
+    assert batches(layouts, lengths, budget=400) == [[0, 1], [3], [2], [4]]  # 3 rows padded to 300 would exceed 400
+    assert batches([()], [5000], budget=1000) == [[0]]  # a row longer than the budget still runs, alone
+
+
+def test_d3_decide_many_runs_each_media_layout_in_its_own_forward():
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    model = d3.D3Model.__new__(d3.D3Model)
+    model.tokenizer, model.pad, model.debias, model.temperature = hf, 248044, False, 1.0
+    model.codes, model.readout = ["A", "B", "C"], torch.eye(3, 4)
+    forwards = []
+
+    def hidden(prompts):
+        forwards.append(len(prompts))
+        return torch.zeros(len(prompts), max(sum(64 if isinstance(t, dict) else 1 for t in p) for p in prompts), 4)
+    model.hidden = hidden
+    q = Question("noul", "S", [(True, None), (False, None)])
+    small, wide = torch.zeros(64, 64, 3), torch.zeros(64, 256, 3)
+    out = model.decide_many([([small], {}, q), ([wide], {}, q), ([small], {}, q), ([], "text", q)])
+    assert len(out) == 4 and sorted(forwards) == [1, 1, 2]

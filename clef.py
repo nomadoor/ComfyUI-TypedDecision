@@ -12,7 +12,7 @@ import comfy.model_patcher
 import comfy.sd
 import comfy.text_encoders.qwen35
 
-from .imajev import fit_grid, image_tokens
+from .imajev import batches, fit_grid, image_tokens, media_layout
 
 HEAD = "clef_head."  # head weights stored in the converted backbone file next to the Core keys
 CONFIG = "clef_head_config"  # safetensors metadata: the release's joint_head_config.json
@@ -189,15 +189,31 @@ class ClefModel:
 
     def decide(self, images, state, question):
         """-> (probabilities over answers, unknown probability (None), abstained (False), calibration version (None))."""
-        images = [prepare_image(image) for image in images]
-        tokens, (question_span, option_spans), order, option_ids = encode(self.tokenizer, state, question, images)
-        if self.pad in tokens:  # Core masks everything after the pad token
-            raise ValueError("The text must not contain <|endoftext|>.")
-        cond = self.clip.encode_from_tokens({self.name: [[(t, 1.0) for t in tokens]]})
-        hidden = cond.reshape(-1, cond.shape[-1])
+        return self.decide_many([(images, state, question)])[0]
+
+    def decide_many(self, requests):
+        """decide for each (images, state, question); requests of the same media layout share backbone forwards."""
+        rows = []  # (images, question, tokens, spans, order, option ids, length)
+        for images, state, question in requests:
+            images = [prepare_image(image) for image in images]
+            tokens, spans, order, option_ids = encode(self.tokenizer, state, question, images)
+            if self.pad in tokens:  # Core masks everything after the pad token
+                raise ValueError("The text must not contain <|endoftext|>.")
+            rows.append((images, question, tokens, spans, order, option_ids, sum(image_tokens(t["data"]) if isinstance(t, dict) else 1 for t in tokens)))
+        hidden = [None] * len(rows)
+        for batch in batches([media_layout(row[0]) for row in rows], [row[-1] for row in rows]):
+            longest = max(len(rows[i][2]) for i in batch)
+            cond = self.clip.encode_from_tokens({self.name: [[(t, 1.0) for t in rows[i][2]] + [(self.pad, 1.0)] * (longest - len(rows[i][2])) for i in batch]})
+            cond = cond.reshape(len(batch), -1, cond.shape[-1])
+            for k, i in enumerate(batch):  # a copy of the record's own tokens, so the padded batch output is freed
+                hidden[i] = cond[k, :rows[i][-1]].to(self.clip.patcher.offload_device, copy=True)
+        # The head runs after every backbone forward: both rarely fit in VRAM together, so it loads once.
         lm_head = self.encoder.transformer.model.lm_head.weight
-        lexical = torch.stack([lm_head[ids].float().mean(dim=0) for ids in option_ids])
         comfy.model_management.load_models_gpu([self.head], force_full_load=True)
         device = self.head.load_device
-        logits = self.head.model(hidden.to(device), question_span, option_spans, question.kind, lexical.to(device))
-        return restore(order, torch.softmax(logits, dim=-1).tolist()), None, False, None
+        out = []
+        for (_, question, _, (question_span, option_spans), order, option_ids, _), h in zip(rows, hidden):
+            lexical = torch.stack([lm_head[ids].float().mean(dim=0) for ids in option_ids])
+            logits = self.head.model(h.to(device), question_span, option_spans, question.kind, lexical.to(device))
+            out.append((restore(order, torch.softmax(logits, dim=-1).tolist()), None, False, None))
+        return out

@@ -19,6 +19,7 @@ PIXELS = 400_000  # training / evaluation image budget
 PATCH = 32  # patch 16 x merge 2
 MIN_PIXELS, MAX_PIXELS = 65_536, 16_777_216  # Qwen3.5 preprocessor_config.json
 MAX_TOKENS = 4096
+MAX_BATCH_TOKENS = 8192  # padded tokens rows may share in one forward (the d3 runtime merges passes at this size)
 BUCKETS = ((2, "2"), (5, "3-5"), (10, "6-10"), (25, "11-25"), (255, "26-254"))
 CALIBRATION_TYPES = {"noul": "boolean", "choice": "choice", "score": "ordinal"}
 CALIBRATION_FILES = ("calibration-rot4-modality.json", "calibration-modality.json", "calibration-rot4.json", "calibration.json")
@@ -140,6 +141,25 @@ def tokenize(tokenizer, text, images):
     return [({"type": "image", "data": next(images), "original_type": "image"}, 1.0) if t == image_pad else (t, 1.0) for t in ids]
 
 
+def batches(layouts, lengths, budget=MAX_BATCH_TOKENS):
+    """Row indices grouped into forwards. A batch shares one media layout, because Core gives every row the multimodal
+    positions of one row, and pads to at most `budget` tokens; a longer row runs alone."""
+    out = []
+    for layout in dict.fromkeys(layouts):
+        group = []
+        for i in (i for i, other in enumerate(layouts) if other == layout):
+            if group and (len(group) + 1) * max(lengths[j] for j in group + [i]) > budget:
+                out.append(group)
+                group = []
+            group.append(i)
+        out.append(group)
+    return out
+
+
+def media_layout(images):
+    return tuple(tuple(image.shape[1:3]) for image in images)
+
+
 def lora_to_comfy(state_dict, alpha):
     """PEFT keys on the HF model -> Core text-encoder LoRA keys, with the alpha PEFT keeps in adapter_config.json."""
     out = {}
@@ -215,29 +235,40 @@ class ImajevModel:
 
     def decide(self, images, state, question):
         """-> (probabilities over answers, unknown probability, abstained, calibration version or None)."""
-        images = [prepare_image(image) for image in images]
+        return self.decide_many([(images, state, question)])[0]
+
+    def decide_many(self, requests):
+        """decide for each (images, state, question); rows of the same media layout share forwards."""
+        requests = [([prepare_image(image) for image in images], state, question) for images, state, question in requests]
+        rows = []  # (request, offset, tokens, length)
+        for r, (images, state, question) in enumerate(requests):
+            n = len(question.answers) + 1
+            labels = [code for code, _ in self.codes[:n]]
+            for offset in rotation_offsets(n, self.debias):
+                tokens = tokenize(self.tokenizer, render(build_prompt(state, question, labels, offset), len(images)), images)
+                if any(t[0] == self.pad for t in tokens):  # Core masks everything after the pad token
+                    raise ValueError("The text must not contain <|endoftext|>.")
+                length = sum(image_tokens(t[0]["data"]) if isinstance(t[0], dict) else 1 for t in tokens)
+                if length > MAX_TOKENS:
+                    raise ValueError(f"The request is {length} tokens; imajev accepts at most {MAX_TOKENS}. Shorten the state or the options.")
+                rows.append((r, offset, tokens, length))
+        passes = [[] for _ in requests]  # (offset, logits) of each request
+        # Right padding cannot reach earlier positions of a causal model, so rows of one layout share a forward.
+        for batch in batches([media_layout(requests[r][0]) for r, *_ in rows], [length for *_, length in rows]):
+            longest = max(len(rows[i][2]) for i in batch)
+            cond = self.clip.encode_from_tokens({self.name: [rows[i][2] + [(self.pad, 1.0)] * (longest - len(rows[i][2])) for i in batch]})
+            hidden = cond.reshape(len(batch), -1, self.readout.shape[1])
+            last = hidden[range(len(batch)), [rows[i][3] - 1 for i in batch]].float()
+            n = max(len(requests[rows[i][0]][2].answers) + 1 for i in batch)
+            for i, row in zip(batch, (last @ self.readout[:n].to(hidden.device).T).tolist()):
+                r, offset = rows[i][:2]
+                passes[r].append((offset, row[:len(requests[r][2].answers) + 1]))
+        return [self._combine(images, state, question, passes[r]) for r, (images, state, question) in enumerate(requests)]
+
+    def _combine(self, images, state, question, passes):
+        """One request's decision from its presentation passes (offset, logits)."""
         n = len(question.answers) + 1
-        labels = [code for code, _ in self.codes[:n]]
         token_ids = [token for _, token in self.codes[:n]]
-        readout = self.readout[:n]
-        offsets = rotation_offsets(n, self.debias)
-        prompts, lengths = [], []
-        for offset in offsets:
-            tokens = tokenize(self.tokenizer, render(build_prompt(state, question, labels, offset), len(images)), images)
-            if any(t[0] == self.pad for t in tokens):  # Core masks everything after the pad token
-                raise ValueError("The text must not contain <|endoftext|>.")
-            length = sum(image_tokens(t[0]["data"]) if isinstance(t[0], dict) else 1 for t in tokens)
-            if length > MAX_TOKENS:
-                raise ValueError(f"The request is {length} tokens; imajev accepts at most {MAX_TOKENS}. Shorten the state or the options.")
-            prompts.append(tokens)
-            lengths.append(length)
-        # All presentation orders in one forward: right padding cannot reach earlier positions of a causal model.
-        longest = max(len(p) for p in prompts)
-        cond = self.clip.encode_from_tokens({self.name: [p + [(self.pad, 1.0)] * (longest - len(p)) for p in prompts]})
-        hidden = cond.reshape(len(prompts), -1, readout.shape[1])
-        last = hidden[range(len(prompts)), [length - 1 for length in lengths]].float()
-        logits = (last @ readout.to(hidden.device).T).tolist()
-        passes = list(zip(offsets, logits))
         if len(passes) == 1:
             logits = passes[0][1]
             selected = select(logits, token_ids)

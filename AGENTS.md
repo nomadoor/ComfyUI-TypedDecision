@@ -9,6 +9,8 @@ This pack runs typed-decision models (noul / choice / score with calibrated prob
 
 ## Implementation constraints
 
+Every family has `decide_many(requests)`; `decide` is `decide_many` with one request. Rows (requests and their presentation orders) share a forward only when their media layout matches (`imajev.batches`), because Core gives a whole batch the multimodal positions of one row; rows share a forward up to 8,192 padded tokens, and a longer row runs alone. Batched and one-by-one results agree to 1e-6.
+
 The nodes reproduce the official imajev torch path (`mohit67890/imajev` @ 523436b8, adapter @ c9e5f132): answers and abstentions match on the reference cases, probabilities within 0.02 and unknown probability within 0.04 (the largest gaps come from one borderline abstention case; int8 ConvRot and fp8 backbones reach 0.07 / 0.04 there and stay under 0.01 elsewhere). Keep these when changing code:
 
 - The prompt text and chat boundary are ported verbatim (`imajev.build_prompt`, `render`); one token of drift changes results. Core's Qwen chat template is not used.

@@ -12,7 +12,7 @@ import comfy.text_encoders.qwen35
 import comfy.text_encoders.qwen_vl
 from comfy.ldm.modules.attention import optimized_attention_for_device
 
-from .imajev import fit_grid, image_tokens, tokenize
+from .imajev import batches, fit_grid, image_tokens, media_layout, tokenize
 
 READOUT = "d3_readout.weight"  # stored in the converted backbone file next to the Core keys
 CONFIG = "d3_decision_config"  # safetensors metadata: the package's decision_config.json
@@ -136,19 +136,26 @@ class D3Model:
 
     def decide(self, images, state, question):
         """-> (probabilities over answers, unknown probability (None), abstained (False), calibration version (None))."""
-        images = [prepare_image(image) for image in images]
-        n = len(question.answers)
-        orders = presentations(question, self.debias)
-        prompts, lengths = [], []
-        for order in orders:
-            tokens = tokenize(self.tokenizer, render(state, question, self.codes[:n], len(images), order), images)
-            if any(t[0] == self.pad for t in tokens):  # Core masks everything after the pad token
-                raise ValueError("The text must not contain <|endoftext|>.")
-            prompts.append([t[0] for t in tokens])
-            lengths.append(sum(image_tokens(t[0]["data"]) if isinstance(t[0], dict) else 1 for t in tokens))
-        longest = max(len(p) for p in prompts)
-        hidden = self.hidden([p + [self.pad] * (longest - len(p)) for p in prompts])
-        last = hidden[range(len(prompts)), [length - 1 for length in lengths]]
-        logits = last @ self.readout[:n].to(hidden.device).T
-        probabilities = torch.softmax(logits / self.temperature, dim=-1).tolist()
-        return average(list(zip(orders, probabilities)), n), None, False, None
+        return self.decide_many([(images, state, question)])[0]
+
+    def decide_many(self, requests):
+        """decide for each (images, state, question); rows of the same media layout share forwards."""
+        requests = [([prepare_image(image) for image in images], state, question) for images, state, question in requests]
+        rows = []  # (request, order, tokens, length)
+        for r, (images, state, question) in enumerate(requests):
+            n = len(question.answers)
+            for order in presentations(question, self.debias):
+                tokens = [t for t, _ in tokenize(self.tokenizer, render(state, question, self.codes[:n], len(images), order), images)]
+                if self.pad in tokens:  # Core masks everything after the pad token
+                    raise ValueError("The text must not contain <|endoftext|>.")
+                rows.append((r, order, tokens, sum(image_tokens(t["data"]) if isinstance(t, dict) else 1 for t in tokens)))
+        passes = [[] for _ in requests]  # (order, probabilities) of each request
+        for batch in batches([media_layout(requests[r][0]) for r, *_ in rows], [length for *_, length in rows]):
+            longest = max(len(rows[i][2]) for i in batch)
+            hidden = self.hidden([rows[i][2] + [self.pad] * (longest - len(rows[i][2])) for i in batch])
+            last = hidden[range(len(batch)), [rows[i][3] - 1 for i in batch]]
+            logits = last @ self.readout[:max(len(rows[i][1]) for i in batch)].to(hidden.device).T
+            for i, row in zip(batch, logits):
+                r, order = rows[i][:2]
+                passes[r].append((order, torch.softmax(row[:len(order)] / self.temperature, dim=-1).tolist()))
+        return [(average(passes[r], len(question.answers)), None, False, None) for r, (_, _, question) in enumerate(requests)]
