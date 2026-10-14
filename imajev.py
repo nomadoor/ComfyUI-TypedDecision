@@ -9,6 +9,7 @@ import torch
 import torchvision.transforms.v2.functional as TF
 from PIL import Image
 
+import comfy.model_management
 import comfy.sd
 import comfy.text_encoders.qwen35
 import comfy.utils
@@ -20,6 +21,7 @@ PATCH = 32  # patch 16 x merge 2
 MIN_PIXELS, MAX_PIXELS = 65_536, 16_777_216  # Qwen3.5 preprocessor_config.json
 MAX_TOKENS = 4096
 MAX_BATCH_TOKENS = 8192  # padded tokens rows may share in one forward (the d3 runtime merges passes at this size)
+ACTIVATION_BYTES = 160  # forward memory per padded token and hidden unit (about 140 measured on d3-mini, Qwen3.5)
 BUCKETS = ((2, "2"), (5, "3-5"), (10, "6-10"), (25, "11-25"), (255, "26-254"))
 CALIBRATION_TYPES = {"noul": "boolean", "choice": "choice", "score": "ordinal"}
 CALIBRATION_FILES = ("calibration-rot4-modality.json", "calibration-modality.json", "calibration-rot4.json", "calibration.json")
@@ -156,6 +158,25 @@ def batches(layouts, lengths, budget=MAX_BATCH_TOKENS):
     return out
 
 
+def memory_estimation(hidden_size):
+    """A Core memory_estimation_function for a typed-decision encoder: the activations of the padded batch, so Core
+    offloads enough weights before a large forward instead of letting it spill out of VRAM."""
+    def estimate(tokens, device=None):
+        rows = next(iter(tokens.values()))
+        longest = max(sum(image_tokens(t[0]["data"]) if isinstance(t[0], dict) and "data" in t[0] else 1 for t in row) for row in rows)
+        return len(rows) * longest * hidden_size * ACTIVATION_BYTES
+    return estimate
+
+
+def token_budget(patcher, hidden_size):
+    """Padded tokens one forward may hold while the whole model stays in VRAM. A forward with most weights offloaded is far
+    slower than several smaller forwards, so batches are cut to fit next to the weights. A model that cannot fit is offloaded
+    anyway, and larger batches stream its weights fewer times. Memory other programs hold on the device is not counted."""
+    free = (comfy.model_management.get_total_memory(patcher.load_device) - patcher.model_size()
+            - comfy.model_management.minimum_inference_memory())
+    return MAX_BATCH_TOKENS if free <= 0 else int(min(MAX_BATCH_TOKENS, free // (hidden_size * ACTIVATION_BYTES)))
+
+
 def media_layout(images):
     return tuple(tuple(image.shape[1:3]) for image in images)
 
@@ -204,6 +225,7 @@ class ImajevModel:
         lora = comfy.utils.load_torch_file(os.path.join(folder, "adapter_model.safetensors"), safe_load=True)
         self.clip = comfy.sd.load_lora_for_models(None, clip, lora_to_comfy(lora, config["lora_alpha"]), 0.0, 1.0)[1]
         self.clip.clip_layer([encoder.num_layers])  # the layer after the last block: the final-normed hidden state
+        self.clip.cond_stage_model.memory_estimation_function = memory_estimation(encoder.transformer.model.config.hidden_size)
         self.pad = encoder.special_tokens["pad"]
 
         tokenizer = getattr(self.clip.tokenizer, self.name).tokenizer
@@ -254,7 +276,8 @@ class ImajevModel:
                 rows.append((r, offset, tokens, length))
         passes = [[] for _ in requests]  # (offset, logits) of each request
         # Right padding cannot reach earlier positions of a causal model, so rows of one layout share a forward.
-        for batch in batches([media_layout(requests[r][0]) for r, *_ in rows], [length for *_, length in rows]):
+        budget = token_budget(self.clip.patcher, self.readout.shape[1])
+        for batch in batches([media_layout(requests[r][0]) for r, *_ in rows], [length for *_, length in rows], budget):
             longest = max(len(rows[i][2]) for i in batch)
             cond = self.clip.encode_from_tokens({self.name: [rows[i][2] + [(self.pad, 1.0)] * (longest - len(rows[i][2])) for i in batch]})
             hidden = cond.reshape(len(batch), -1, self.readout.shape[1])

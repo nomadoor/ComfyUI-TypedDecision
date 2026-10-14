@@ -121,6 +121,37 @@ def imajev_settings():
     ]
 
 
+def mode_input():
+    return io.DynamicCombo.Input("mode", options=[
+        io.DynamicCombo.Option("noul", [
+            io.String.Input("instructions", multiline=True, default="",
+                            placeholder="instructions: a claim to judge true or false, or a yes/no question.\ne.g. Many people are in the image."),
+            io.String.Input("criteria_true", multiline=True, default="", optional=True,
+                            placeholder="criteria_true (optional): when the answer is yes.\ne.g. five or more people are visible"),
+            io.String.Input("criteria_false", multiline=True, default="", optional=True,
+                            placeholder="criteria_false (optional): when the answer is no.\ne.g. four or fewer people are visible"),
+        ]),
+        io.DynamicCombo.Option("choice", [
+            io.String.Input("instructions", multiline=True, default="",
+                            placeholder="instructions: the question to answer.\ne.g. What is the main subject of the image?"),
+            io.String.Input("criteria", multiline=True, default="",
+                            placeholder="criteria: the options, one per line. Add ': description' to explain one.\ne.g.\nperson\nanimal\nvehicle\nfood\nlandscape: scenery with no clear main subject"),
+        ]),
+        io.DynamicCombo.Option("score", [
+            io.String.Input("instructions", multiline=True, default="",
+                            placeholder="instructions: the question to rate.\ne.g. How usable is this photo for a training dataset?"),
+            io.String.Input("criteria", multiline=True, default="",
+                            placeholder="criteria: the levels, one per line, lowest first.\ne.g.\nunusable: blurry, dark or badly cropped\npoor\nacceptable\ngood\nexcellent: sharp, well lit, subject fills the frame"),
+        ]),
+    ], tooltip="noul: true or false. choice: pick one option. score: rate on ordered levels. Write in English.")
+
+
+def state_input():
+    return io.String.Input("state", multiline=True, default="",
+                           placeholder="state: the facts to judge against (optional). Plain text or JSON.\ne.g. full body shot of a knight standing in a castle hall",
+                           tooltip="With JSON, instructions can name its fields in `backticks`, e.g. `listing.color`.")
+
+
 class LoadTypedDecisionModel(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -162,35 +193,12 @@ class TypedDecision(io.ComfyNode):
             category="typed decision",
             description="Answers one typed question about the images and state with calibrated probabilities.",
             inputs=[
-                io.DynamicCombo.Input("mode", options=[
-                    io.DynamicCombo.Option("noul", [
-                        io.String.Input("instructions", multiline=True, default="",
-                                        placeholder="instructions: a claim to judge true or false, or a yes/no question.\ne.g. Many people are in the image."),
-                        io.String.Input("criteria_true", multiline=True, default="", optional=True,
-                                        placeholder="criteria_true (optional): when the answer is yes.\ne.g. five or more people are visible"),
-                        io.String.Input("criteria_false", multiline=True, default="", optional=True,
-                                        placeholder="criteria_false (optional): when the answer is no.\ne.g. four or fewer people are visible"),
-                    ]),
-                    io.DynamicCombo.Option("choice", [
-                        io.String.Input("instructions", multiline=True, default="",
-                                        placeholder="instructions: the question to answer.\ne.g. What is the main subject of the image?"),
-                        io.String.Input("criteria", multiline=True, default="",
-                                        placeholder="criteria: the options, one per line. Add ': description' to explain one.\ne.g.\nperson\nanimal\nvehicle\nfood\nlandscape: scenery with no clear main subject"),
-                    ]),
-                    io.DynamicCombo.Option("score", [
-                        io.String.Input("instructions", multiline=True, default="",
-                                        placeholder="instructions: the question to rate.\ne.g. How usable is this photo for a training dataset?"),
-                        io.String.Input("criteria", multiline=True, default="",
-                                        placeholder="criteria: the levels, one per line, lowest first.\ne.g.\nunusable: blurry, dark or badly cropped\npoor\nacceptable\ngood\nexcellent: sharp, well lit, subject fills the frame"),
-                    ]),
-                ], tooltip="noul: true or false. choice: pick one option. score: rate on ordered levels. Write in English."),
+                mode_input(),
                 TypedDecisionModel.Input("model"),
                 io.Autogrow.Input("images", optional=True, template=io.Autogrow.TemplatePrefix(
                     input=io.Image.Input("image"), prefix="image_", min=0),
                     tooltip="Images looked at together, in slot order. imajev: first = reference, second = the one to judge."),
-                io.String.Input("state", multiline=True, default="",
-                                placeholder="state: the facts to judge against (optional). Plain text or JSON.\ne.g. full body shot of a knight standing in a castle hall",
-                                tooltip="With JSON, instructions can name its fields in `backticks`, e.g. `listing.color`."),
+                state_input(),
                 io.Float.Input("threshold", default=0.5, min=0.0, max=10.0, step=0.01, tooltip="pass is true when value >= threshold and the model did not abstain."),
             ],
             outputs=[

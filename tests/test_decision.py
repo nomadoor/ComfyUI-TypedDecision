@@ -1,16 +1,18 @@
 import hashlib
 import json
 import math
+import types
 
 import pytest
 import safetensors.torch
 import torch
 
+import comfy.model_management
 import comfy.text_encoders.qwen35
 import folder_paths
 from comfy_api.latest import io
-from typed_decision import clef, d3
-from typed_decision.imajev import (ImajevModel, Question, batches, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
+from typed_decision import clef, d3, imajev, region
+from typed_decision.imajev import (MAX_BATCH_TOKENS, ImajevModel, Question, batches, memory_estimation, token_budget, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
                     render, rotation_offsets, select, temperature, tokenize)
 from typed_decision.nodes import (LoadTypedDecisionModel, TypedDecision, answer, check_limits, parse_levels, parse_options, parse_state,
                                   question_from_mode)
@@ -399,7 +401,8 @@ def test_d3_decide_many_runs_each_media_layout_in_its_own_forward():
     hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
     model = d3.D3Model.__new__(d3.D3Model)
     model.tokenizer, model.pad, model.debias, model.temperature = hf, 248044, False, 1.0
-    model.codes, model.readout = ["A", "B", "C"], torch.eye(3, 4)
+    model.codes, model.readout, model.hidden_size = ["A", "B", "C"], torch.eye(3, 4), 4
+    model.clip = types.SimpleNamespace(patcher=types.SimpleNamespace(load_device=torch.device("cpu"), model_size=lambda: 0))
     forwards = []
 
     def hidden(prompts):
@@ -410,3 +413,136 @@ def test_d3_decide_many_runs_each_media_layout_in_its_own_forward():
     small, wide = torch.zeros(64, 64, 3), torch.zeros(64, 256, 3)
     out = model.decide_many([([small], {}, q), ([wide], {}, q), ([small], {}, q), ([], "text", q)])
     assert len(out) == 4 and sorted(forwards) == [1, 1, 2]
+def test_region_threshold_runs_from_top_to_bottom():
+    assert region.threshold_at(0, 2, 0.3, 0.7) == pytest.approx(0.3)
+    assert region.threshold_at(1, 2, 0.3, 0.7) == pytest.approx(0.5)
+    assert region.threshold_at(2, 2, 0.3, 0.7) == pytest.approx(0.7)
+    assert region.threshold_at(0, 0, 0.3, 0.7) == pytest.approx(0.3)
+
+
+def test_region_tiles_cover_the_image_without_gaps():
+    assert region.tile_box(0, 0, 0, 101, 50) == (0, 0, 101, 50)
+    assert [region.tile_box(1, 0, c, 101, 50) for c in (0, 1)] == [(0, 0, 50, 25), (50, 0, 101, 25)]
+    assert region.tile_box(2, 3, 3, 101, 50) == (75, 37, 101, 50)
+
+
+def test_region_context_widens_by_the_tile_size_and_stays_inside_the_image():
+    assert region.context_box((40, 40, 60, 80), 0.25, 100, 100) == (35, 30, 65, 90)
+    # at an edge the widened crop keeps its size and shifts inward, so the tiles of a level share one crop size
+    assert region.context_box((0, 50, 50, 100), 0.25, 100, 100) == (0, 26, 74, 100)
+    assert region.context_box((0, 0, 100, 100), 0.25, 100, 100) == (0, 0, 100, 100)
+
+
+def fake_judge(hits, levels=None):
+    """Positive where the crop contains any of the points in hits; records each crop and, in levels, each call's size."""
+    calls = []
+
+    def judge(boxes, threshold):
+        out = []
+        for x0, y0, x1, y1 in boxes:
+            calls.append(((x0, y0, x1, y1), threshold))
+            value = 1.0 if any(x0 <= x < x1 and y0 <= y < y1 for x, y in hits) else 0.0
+            out.append((value, value >= threshold))
+        if levels is not None:
+            levels.append(len(boxes))
+        return out
+    return judge, calls
+
+
+def test_region_search_recurses_only_into_positive_tiles():
+    judge, calls = fake_judge([(10, 10)])
+    tiles = region.search(judge, 64, 64, 2, 0.3, 0.7, 0.0)
+    assert len(calls) == 1 + 4 + 4
+    assert [(t.depth, t.row, t.col) for t in tiles if t.positive] == [(0, 0, 0), (1, 0, 0), (2, 0, 0)]
+    assert [threshold for _, threshold in calls] == pytest.approx([0.3] + [0.5] * 4 + [0.7] * 4)
+
+
+def test_region_search_judges_each_level_in_one_call():
+    levels = []
+    judge, _ = fake_judge([(10, 10), (50, 50)], levels)
+    region.search(judge, 64, 64, 2, 0.5, 0.5, 0.0)
+    assert levels == [1, 4, 8]
+
+
+def test_region_search_judges_widened_crops():
+    judge, calls = fake_judge([(33, 10)])  # just right of the depth-1 split
+    tiles = region.search(judge, 64, 64, 1, 0.5, 0.5, 0.25)
+    assert calls[1][0] == (0, 0, 48, 48)  # the corner tile keeps the full widened size
+    assert {(t.row, t.col) for t in tiles if t.positive and t.depth == 1} == {(0, 0), (0, 1)}
+
+
+def test_region_search_stops_without_a_hit_and_on_tiny_tiles():
+    judge, _ = fake_judge([])
+    assert len(region.search(judge, 64, 64, 3, 0.5, 0.5, 0.25)) == 1
+    judge, _ = fake_judge([(0, 0)])
+    assert max(t.depth for t in region.search(judge, 4, 4, 5, 0.5, 0.5, 0.0)) == 2
+
+
+def tile(depth, row, col, value=1.0, positive=True):
+    return region.Tile(depth, row, col, value, positive)
+
+
+def test_region_leaves_are_positive_tiles_that_were_not_split():
+    # (1, 0, 1) was too small to split; the four tiles of (1, 1, 0) all failed, so they overrule it
+    tiles = [tile(0, 0, 0), tile(1, 0, 0), tile(1, 0, 1), tile(1, 1, 0), tile(1, 1, 1, 0.0, False),
+             tile(2, 0, 0), tile(2, 0, 1, 0.0, False), tile(2, 1, 0, 0.0, False), tile(2, 1, 1, 0.0, False),
+             tile(2, 2, 0, 0.0, False), tile(2, 2, 1, 0.0, False), tile(2, 3, 0, 0.0, False), tile(2, 3, 1, 0.0, False)]
+    assert [(t.depth, t.row, t.col) for t in region.leaves(tiles)] == [(1, 0, 1), (2, 0, 0)]
+
+
+def test_region_boxes_join_4_neighbour_leaves_across_depths():
+    # a depth-1 leaf (top right) touches the depth-2 leaf at (1, 1); the depth-2 leaf at (3, 0) stands alone
+    leaves = [tile(1, 0, 1, 0.6), tile(2, 1, 1, 0.9), tile(2, 3, 0, 0.8)]
+    assert region.boxes(leaves, 100, 100) == [{"x": 25, "y": 0, "width": 75, "height": 50, "score": 0.9},
+                                              {"x": 0, "y": 75, "width": 25, "height": 25, "score": 0.8}]
+    assert len(region.boxes(leaves + [tile(2, 2, 1), tile(2, 2, 0)], 100, 100)) == 1
+    assert region.boxes([], 100, 100) == []
+    assert region.boxes([tile(2, 0, 0), tile(2, 1, 1)], 100, 100) == [  # diagonal tiles are separate groups
+        {"x": 0, "y": 0, "width": 25, "height": 25, "score": 1.0}, {"x": 25, "y": 25, "width": 25, "height": 25, "score": 1.0}]
+
+
+def test_region_mask_and_heatmap():
+    tiles = [tile(0, 0, 0, 0.5), tile(1, 0, 0, 0.25, False), tile(1, 0, 1, 1.0), tile(1, 1, 0, 0.0, False), tile(1, 1, 1, 0.0, False)]
+    assert region.mask(region.leaves(tiles), 4, 2).tolist() == [[0, 0, 1, 1], [0, 0, 0, 0]]
+    heat = region.heatmap(tiles, 4, 2, 0.5)
+    assert heat.shape == (2, 4, 3) and heat[..., 0].tolist() == [[0.5, 0.5, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]]
+
+
+def test_region_node_searches_each_image_of_the_batch():
+    calls = []
+
+    class Model:
+        max_images, max_options, max_levels = 1, 255, 10
+
+        def decide_many(self, requests):
+            calls.extend((tuple(images[0].shape), state, question.kind) for images, state, question in requests)
+            return [([0.9, 0.1], None, False, None)] * len(requests)
+
+    out = region.RegionSearch.execute({"mode": "noul", "instructions": "A cat."}, Model(), torch.rand(2, 32, 48, 3), '{"a": 1}', 1, 0.3, 0.6, 0.0)
+    mask, bboxes, heat = out.result
+    assert len(calls) == 2 * 5 and calls[0] == ((32, 48, 3), {"a": 1}, "noul") and calls[1][0] == (16, 24, 3)
+    assert mask.shape == (2, 32, 48) and mask.min() == 1 and heat.shape == (2, 32, 48, 3)
+    assert bboxes == [[{"x": 0, "y": 0, "width": 48, "height": 32, "score": pytest.approx(0.9)}]] * 2
+
+
+def test_region_node_shares_the_decision_mode():
+    inputs = schema_inputs(region.RegionSearch)
+    assert list(inputs) == ["mode", "model", "image", "state", "max_depth", "threshold_top", "threshold_bottom", "context_margin"]
+    assert inputs["mode"].as_dict() == schema_inputs(TypedDecision)["mode"].as_dict()
+
+
+def test_memory_estimation_counts_the_padded_batch_with_image_tokens():
+    image = torch.zeros(1, 64, 96, 3)  # 6 image tokens
+    tokens = {"qwen35_4b": [[(1, 1.0), ({"type": "image", "data": image}, 1.0), (2, 1.0)], [(1, 1.0), (2, 1.0), (3, 1.0)]]}
+    assert memory_estimation(10)(tokens) == 2 * 8 * 10 * imajev.ACTIVATION_BYTES
+
+
+def test_token_budget_fits_batches_next_to_the_weights(monkeypatch):
+    gib = 2 ** 30
+    monkeypatch.setattr(comfy.model_management, "get_total_memory", lambda device: 12 * gib)
+    monkeypatch.setattr(comfy.model_management, "minimum_inference_memory", lambda: 1 * gib)
+    patcher = lambda size: types.SimpleNamespace(load_device=None, model_size=lambda: size)
+    assert token_budget(patcher(10 * gib), 4096) == gib // (4096 * imajev.ACTIVATION_BYTES)
+    assert token_budget(patcher(1 * gib), 1024) == MAX_BATCH_TOKENS  # plenty of room: the usual cap
+    # a model that cannot fit is offloaded anyway; larger batches stream its weights fewer times
+    assert token_budget(patcher(12 * gib), 4096) == MAX_BATCH_TOKENS

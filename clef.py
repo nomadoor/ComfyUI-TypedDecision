@@ -12,7 +12,7 @@ import comfy.model_patcher
 import comfy.sd
 import comfy.text_encoders.qwen35
 
-from .imajev import batches, fit_grid, image_tokens, media_layout
+from .imajev import batches, fit_grid, image_tokens, media_layout, memory_estimation, token_budget
 
 HEAD = "clef_head."  # head weights stored in the converted backbone file next to the Core keys
 CONFIG = "clef_head_config"  # safetensors metadata: the release's joint_head_config.json
@@ -176,6 +176,7 @@ class ClefModel:
             raise ValueError("The Clef backbone did not load as Qwen3.5.")
         self.name = self.clip.cond_stage_model.clip_name
         self.encoder = getattr(self.clip.cond_stage_model, self.name)
+        self.clip.cond_stage_model.memory_estimation_function = memory_estimation(self.encoder.transformer.model.config.hidden_size)
         self.clip.clip_layer([self.encoder.num_layers])  # the layer after the last block: the final-normed hidden state
         self.pad = self.encoder.special_tokens["pad"]
         self.tokenizer = getattr(self.clip.tokenizer, self.name).tokenizer
@@ -201,7 +202,8 @@ class ClefModel:
                 raise ValueError("The text must not contain <|endoftext|>.")
             rows.append((images, question, tokens, spans, order, option_ids, sum(image_tokens(t["data"]) if isinstance(t, dict) else 1 for t in tokens)))
         hidden = [None] * len(rows)
-        for batch in batches([media_layout(row[0]) for row in rows], [row[-1] for row in rows]):
+        budget = token_budget(self.clip.patcher, self.encoder.transformer.model.config.hidden_size)
+        for batch in batches([media_layout(row[0]) for row in rows], [row[-1] for row in rows], budget):
             longest = max(len(rows[i][2]) for i in batch)
             cond = self.clip.encode_from_tokens({self.name: [[(t, 1.0) for t in rows[i][2]] + [(self.pad, 1.0)] * (longest - len(rows[i][2])) for i in batch]})
             cond = cond.reshape(len(batch), -1, cond.shape[-1])

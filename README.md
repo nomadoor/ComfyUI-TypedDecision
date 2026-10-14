@@ -77,6 +77,20 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 | `abstained` | The images and state were not enough to answer (imajev; always false for d3 and Clef-flash) |
 | `result` | Full answer as JSON |
 
+**Typed Decision Region Search**: finds where in an image a decision holds. It is a search over decisions, not an object detector. It judges the whole image; when the tile's `value` >= the threshold (abstaining counts as no), it splits the tile into four and judges each, down to `max_depth`.
+
+- `mode`, `state`: as in Typed Decision. Each tile is one decision on one image. With choice, `value` is the probability of the most likely option.
+- `threshold_top` / `threshold_bottom`: the threshold for the whole image and at `max_depth`, linear in between. Keep the top lenient so small hits are not cut off early. With score, the value is the expected level, so set both on that scale.
+- `context_margin`: each tile is judged on a crop widened by this fraction of the tile size on every side.
+- A batch is searched image by image. The tiles of one level are judged together.
+- Small hits such as a mosaic or a broken hand need d3-flash or d3-mini; d3-lite is too weak for them.
+
+| Output | Meaning |
+| --- | --- |
+| `mask` | Positive tiles at `max_depth` (or too small to split), filled. A tile that was split counts only through its four tiles. |
+| `bboxes` | Per image, one box around each group of touching positive tiles; `score` is the highest `value` in the group |
+| `heatmap` | The `value` of the deepest tile judged at each pixel (white = 1; score: the last level) |
+
 ## Sample workflows
 
 - [noul](example_workflows/typed_decision_noul.json): are many people in the image?

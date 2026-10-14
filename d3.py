@@ -12,7 +12,7 @@ import comfy.text_encoders.qwen35
 import comfy.text_encoders.qwen_vl
 from comfy.ldm.modules.attention import optimized_attention_for_device
 
-from .imajev import batches, fit_grid, image_tokens, media_layout, tokenize
+from .imajev import batches, fit_grid, image_tokens, media_layout, memory_estimation, token_budget, tokenize
 
 READOUT = "d3_readout.weight"  # stored in the converted backbone file next to the Core keys
 CONFIG = "d3_decision_config"  # safetensors metadata: the package's decision_config.json
@@ -104,6 +104,8 @@ class D3Model:
             raise ValueError("The d3 backbone did not load as Qwen3.5.")
         self.name = self.clip.cond_stage_model.clip_name
         self.encoder = getattr(self.clip.cond_stage_model, self.name)
+        self.hidden_size = self.encoder.transformer.model.config.hidden_size
+        self.clip.cond_stage_model.memory_estimation_function = memory_estimation(self.hidden_size)
         self.pad = self.encoder.special_tokens["pad"]
         self.tokenizer = getattr(self.clip.tokenizer, self.name).tokenizer
         check_codes(self.tokenizer, config["codes"], config["token_ids"])
@@ -117,7 +119,7 @@ class D3Model:
 
     def hidden(self, prompts):
         """Final-normed hidden states of a right-padded batch, with the full-attention layers reading the whole prompt."""
-        self.clip.load_model()
+        self.clip.load_model({self.name: [[(t, 1.0) for t in p] for p in prompts]})
         device = self.clip.patcher.load_device
         model = self.encoder.transformer.model
         with comfy.model_management.cuda_device_context(device):
@@ -150,7 +152,8 @@ class D3Model:
                     raise ValueError("The text must not contain <|endoftext|>.")
                 rows.append((r, order, tokens, sum(image_tokens(t["data"]) if isinstance(t, dict) else 1 for t in tokens)))
         passes = [[] for _ in requests]  # (order, probabilities) of each request
-        for batch in batches([media_layout(requests[r][0]) for r, *_ in rows], [length for *_, length in rows]):
+        budget = token_budget(self.clip.patcher, self.hidden_size)
+        for batch in batches([media_layout(requests[r][0]) for r, *_ in rows], [length for *_, length in rows], budget):
             longest = max(len(rows[i][2]) for i in batch)
             hidden = self.hidden([rows[i][2] + [self.pad] * (longest - len(rows[i][2])) for i in batch])
             last = hidden[range(len(batch)), [rows[i][3] - 1 for i in batch]]
