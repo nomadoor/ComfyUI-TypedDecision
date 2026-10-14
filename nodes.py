@@ -65,17 +65,19 @@ def question_from_mode(mode):
     return question
 
 
-def check_limits(model, question, n_images):
+def check_limits(model, question, n_images, n_videos):
     if n_images > model.max_images:
         raise ValueError(f"This model accepts at most {model.max_images} images; got {n_images}.")
+    if n_videos > model.max_videos:
+        raise ValueError(f"This model does not accept videos; got {n_videos}.")
     if question.kind == "choice" and len(question.answers) > model.max_options:
         raise ValueError(f"This model accepts at most {model.max_options} options; got {len(question.answers)}.")
     if question.kind == "score" and len(question.answers) > model.max_levels:
         raise ValueError(f"This model accepts at most {model.max_levels} levels; got {len(question.answers)}.")
 
 
-def answer(model, question, decision, threshold):
-    """Typed Decision outputs from model.decide, in the model family's official answer shape.
+def answer(model, question, decision, threshold, notes=None):
+    """Typed Decision outputs from model.decide, in the model family's official answer shape, plus `notes` in the result.
 
     Models without unknown report unknown as None and never abstain."""
     scores, unknown, abstained, calibration_version = decision
@@ -100,7 +102,7 @@ def answer(model, question, decision, threshold):
             value, label = sum(i * p for i, p in enumerate(known)), question.answers[index][1]
             result = {"type": "score", "score": value, "legend": {str(v): d for v, d in question.answers},
                       "probabilities": {str(v): p for (v, _), p in zip(question.answers, known)}, "confidence": confidence, **common}
-    return value, label, index, value >= threshold and not abstained, abstained, json.dumps(result, ensure_ascii=False)
+    return value, label, index, value >= threshold and not abstained, abstained, json.dumps({**result, **(notes or {})}, ensure_ascii=False)
 
 
 def decision_folders():
@@ -109,7 +111,10 @@ def decision_folders():
 
 def adapter_options():
     """imajev folders in models/typed_decision, then d3 and clef, whose heads are inside their backbone files."""
-    d3_settings = [io.Boolean.Input("debias", default=False, tooltip="Also score choice options in reverse order and average. Slower.")]
+    d3_settings = [io.Boolean.Input("debias", default=False, tooltip="Also score choice options in reverse order and average. Slower."),
+                   io.Float.Input("fps", default=2.0, min=0.01, max=30.0, step=0.1, tooltip="Video frames read per second, over the whole video. "
+                                  "d3 reads videos at 2. All frames go into one request, so long videos are slow; lower it to 1 or 0.5 to make them lighter. "
+                                  "The result JSON tells how many frames were read.")]
     return ([io.DynamicCombo.Option(folder, imajev_settings()) for folder in decision_folders()]
             + [io.DynamicCombo.Option("d3", d3_settings), io.DynamicCombo.Option("clef", [])])
 
@@ -175,7 +180,7 @@ class LoadTypedDecisionModel(io.ComfyNode):
         name = adapter["adapter"]
         backbone = folder_paths.get_full_path_or_raise("text_encoders", backbone)
         if name == "d3":
-            return io.NodeOutput(d3.D3Model(backbone, adapter["debias"]))
+            return io.NodeOutput(d3.D3Model(backbone, adapter["debias"], adapter["fps"]))
         if name == "clef":
             return io.NodeOutput(clef.ClefModel(backbone))
         folder = os.path.dirname(folder_paths.get_full_path_or_raise("typed_decision", os.path.join(name, imajev.MARKER)))
@@ -198,6 +203,9 @@ class TypedDecision(io.ComfyNode):
                 io.Autogrow.Input("images", optional=True, template=io.Autogrow.TemplatePrefix(
                     input=io.Image.Input("image"), prefix="image_", min=0),
                     tooltip="Images looked at together, in slot order. imajev: first = reference, second = the one to judge."),
+                io.Autogrow.Input("videos", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Video.Input("video"), prefix="video_", min=0),
+                    tooltip="Videos looked at together with the images, in slot order (d3). Read at the loader's fps over the whole video."),
                 state_input(),
                 io.Float.Input("threshold", default=0.5, min=0.0, max=10.0, step=0.01, tooltip="pass is true when value >= threshold and the model did not abstain."),
             ],
@@ -213,9 +221,14 @@ class TypedDecision(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mode, model, state, threshold, images=None):
-        slots = sorted((images or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[1]))
-        frames = [batch[i] for _, batch in slots if batch is not None for i in range(batch.shape[0])]
+    def execute(cls, mode, model, state, threshold, images=None, videos=None):
+        slot = lambda item: int(item[0].rsplit("_", 1)[1])
+        frames = [batch[i] for _, batch in sorted((images or {}).items(), key=slot) if batch is not None for i in range(batch.shape[0])]
+        clips = [video for _, video in sorted((videos or {}).items(), key=slot) if video is not None]
         question = question_from_mode(mode)
-        check_limits(model, question, len(frames))
-        return io.NodeOutput(*answer(model, question, model.decide(frames, parse_state(state), question), threshold))
+        check_limits(model, question, len(frames), len(clips))
+        notes = None
+        if clips:
+            plans = [model.video_plan(video) for video in clips]
+            notes = {"videos": [{"frames": len(indices), "interval": (indices[-1] - indices[0]) / fps / max(1, len(indices) - 1)} for indices, fps in plans]}
+        return io.NodeOutput(*answer(model, question, model.decide(frames, clips, parse_state(state), question), threshold, notes))

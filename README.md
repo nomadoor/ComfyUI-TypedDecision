@@ -59,6 +59,7 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 **Load Typed Decision Model**: for imajev, pick Qwen3.5 as `backbone` and imajev-4b as `adapter`. For d3 and Clef-flash, pick the model file as `backbone` and `d3` or `clef` as `adapter`. The model's own settings appear under `adapter`:
 
 - `debias`: average over several option orders (slower). d3 also scores choice options in reverse order.
+- `fps` (d3): video frames read per second, over the whole video (default 2, as d3 reads videos).
 - `calibration` (imajev): apply the model's temperature calibration
 
 **Typed Decision**: answers one question. Write questions and options in English.
@@ -66,6 +67,7 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 - `mode`: `noul`, `choice` or `score`
 - `instructions` / `criteria`: the question, and the options or levels, one per line. noul takes optional `criteria_true` / `criteria_false` for when to answer yes or no.
 - `images`: imajev takes up to 2 (with two, the first is the reference and the second is the one to judge); d3 and Clef-flash take any number.
+- `videos` (d3): any number of videos, read at the loader's `fps` over the whole video. All the frames go into one request: a minute of video at 2 fps is 120 frames, and long videos get slow quickly, so lower `fps` for them. Only the frames read are kept in memory. The `result` JSON lists how many frames were read and how far apart they are.
 - `state`: optional facts to judge against, as text or JSON
 
 | Output | Meaning |

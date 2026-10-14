@@ -144,7 +144,7 @@ class RegionSearch(io.ComfyNode):
     @classmethod
     def execute(cls, mode, model, image, state, max_depth, threshold_top, threshold_bottom, context_margin):
         question = question_from_mode(mode)
-        check_limits(model, question, 1)
+        check_limits(model, question, 1, 0)
         state = parse_state(state)
         _, height, width, _ = image.shape
         top = len(question.answers) - 1 if question.kind == "score" else 1.0
@@ -152,7 +152,7 @@ class RegionSearch(io.ComfyNode):
         for frame in image:
             def judge(boxes, threshold):
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                decisions = model.decide_many([([frame[y0:y1, x0:x1]], state, question) for x0, y0, x1, y1 in boxes])
+                decisions = model.decide_many([([frame[y0:y1, x0:x1]], [], state, question) for x0, y0, x1, y1 in boxes])
                 outputs = [answer(model, question, decision, threshold) for decision in decisions]
                 return [(value, passed) for value, _, _, passed, _, _ in outputs]
 

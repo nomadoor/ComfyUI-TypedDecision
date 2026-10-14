@@ -95,13 +95,13 @@ def downscale(width, height, pixels=PIXELS):
     return (max(1, int(width * scale)), max(1, int(height * scale))) if scale < 1 else (width, height)
 
 
-def grid_size(width, height, max_pixels=MAX_PIXELS):
+def grid_size(width, height, max_pixels=MAX_PIXELS, min_pixels=MIN_PIXELS):
     h, w = round(height / PATCH) * PATCH, round(width / PATCH) * PATCH
     if h * w > max_pixels:
         beta = math.sqrt(height * width / max_pixels)
         h, w = max(PATCH, math.floor(height / beta / PATCH) * PATCH), max(PATCH, math.floor(width / beta / PATCH) * PATCH)
-    elif h * w < MIN_PIXELS:
-        beta = math.sqrt(MIN_PIXELS / (height * width))
+    elif h * w < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
         h, w = math.ceil(height * beta / PATCH) * PATCH, math.ceil(width * beta / PATCH) * PATCH
     return w, h
 
@@ -132,15 +132,16 @@ def image_tokens(image):
     return (h // PATCH) * (w // PATCH)
 
 
-def tokenize(tokenizer, text, images):
+def tokenize(tokenizer, text, images, videos=()):
     """Core encoder tokens for the text as written (Core's tokenize would apply SD prompt syntax such as embedding: and escapes),
-    each <|image_pad|> carrying its image."""
-    image_pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    each <|image_pad|> carrying its image and each <|video_pad|> the next of `videos`."""
+    image_pad, video_pad = tokenizer.convert_tokens_to_ids(["<|image_pad|>", "<|video_pad|>"])
     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-    if ids.count(image_pad) != len(images):
-        raise ValueError("The text must not contain <|image_pad|>.")
-    images = iter(images)
-    return [({"type": "image", "data": next(images), "original_type": "image"}, 1.0) if t == image_pad else (t, 1.0) for t in ids]
+    if ids.count(image_pad) != len(images) or ids.count(video_pad) != len(videos):
+        raise ValueError("The text must not contain <|image_pad|> or <|video_pad|>.")
+    images, videos = iter(images), iter(videos)
+    media = {image_pad: lambda: {"type": "image", "data": next(images), "original_type": "image"}, video_pad: lambda: next(videos)}
+    return [(media[t](), 1.0) if t in media else (t, 1.0) for t in ids]
 
 
 def batches(layouts, lengths, budget=MAX_BATCH_TOKENS):
@@ -163,7 +164,7 @@ def memory_estimation(hidden_size):
     offloads enough weights before a large forward instead of letting it spill out of VRAM."""
     def estimate(tokens, device=None):
         rows = next(iter(tokens.values()))
-        longest = max(sum(image_tokens(t[0]["data"]) if isinstance(t[0], dict) and "data" in t[0] else 1 for t in row) for row in rows)
+        longest = max(sum((t[0].get("tokens") or image_tokens(t[0]["data"])) if isinstance(t[0], dict) else 1 for t in row) for row in rows)
         return len(rows) * longest * hidden_size * ACTIVATION_BYTES
     return estimate
 
@@ -197,6 +198,7 @@ def is_imajev(folder):
 
 class ImajevModel:
     max_images = 2
+    max_videos = 0
     max_levels = 10
 
     def __init__(self, backbone_path, folder, debias, calibrate):
@@ -255,13 +257,13 @@ class ImajevModel:
                 return calibration
         return None
 
-    def decide(self, images, state, question):
+    def decide(self, images, videos, state, question):
         """-> (probabilities over answers, unknown probability, abstained, calibration version or None)."""
-        return self.decide_many([(images, state, question)])[0]
+        return self.decide_many([(images, videos, state, question)])[0]
 
     def decide_many(self, requests):
-        """decide for each (images, state, question); rows of the same media layout share forwards."""
-        requests = [([prepare_image(image) for image in images], state, question) for images, state, question in requests]
+        """decide for each (images, videos, state, question); imajev takes no videos. Rows of the same media layout share forwards."""
+        requests = [([prepare_image(image) for image in images], state, question) for images, _, state, question in requests]
         rows = []  # (request, offset, tokens, length)
         for r, (images, state, question) in enumerate(requests):
             n = len(question.answers) + 1

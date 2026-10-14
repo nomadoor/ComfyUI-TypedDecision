@@ -164,6 +164,7 @@ class JointSchemaHead(torch.nn.Module):
 
 class ClefModel:
     max_images = math.inf
+    max_videos = 0
     max_options = math.inf
     max_levels = math.inf
 
@@ -188,14 +189,15 @@ class ClefModel:
         """The probability of the chosen answer, as the release reports it."""
         return max(known)
 
-    def decide(self, images, state, question):
+    def decide(self, images, videos, state, question):
         """-> (probabilities over answers, unknown probability (None), abstained (False), calibration version (None))."""
-        return self.decide_many([(images, state, question)])[0]
+        return self.decide_many([(images, videos, state, question)])[0]
 
     def decide_many(self, requests):
-        """decide for each (images, state, question); requests of the same media layout share backbone forwards."""
+        """decide for each (images, videos, state, question); Clef takes no videos yet. Requests of the same media layout
+        share backbone forwards."""
         rows = []  # (images, question, tokens, spans, order, option ids, length)
-        for images, state, question in requests:
+        for images, _, state, question in requests:
             images = [prepare_image(image) for image in images]
             tokens, spans, order, option_ids = encode(self.tokenizer, state, question, images)
             if self.pad in tokens:  # Core masks everything after the pad token
