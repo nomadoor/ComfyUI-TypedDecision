@@ -227,7 +227,7 @@ class TypedDecision(io.ComfyNode):
                 io.String.Output(display_name="label", tooltip="The answer: yes / no, the chosen option, or the most likely level. Not affected by threshold."),
                 io.Int.Output(display_name="index", tooltip="noul: yes = 1, no = 0. choice / score: line number of the answer, from 0."),
                 io.Boolean.Output(display_name="pass", tooltip="True when value >= threshold and the model did not abstain. Use it to branch."),
-                io.Boolean.Output(display_name="abstained", tooltip="True when the images and state are not enough to answer, e.g. to send the case to a person. Always false for models without unknown (d3)."),
+                io.Boolean.Output(display_name="abstained", tooltip="True when the images and state are not enough to answer, e.g. to send the case to a person. Always false for d3 and Clef-flash, which have no unknown."),
                 io.String.Output(display_name="result", tooltip="Full answer as JSON, in the model's official answer shape: every probability and confidence (imajev also unknown probability)."),
             ],
         )
