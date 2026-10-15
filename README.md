@@ -79,18 +79,19 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 | `abstained` | The images and state were not enough to answer (imajev; always false for d3 and Clef-flash) |
 | `result` | Full answer as JSON |
 
-**Typed Decision Interval Search**: finds when in a video something one frame can show holds, such as "A dog is visible." It reads the whole video at 2 fps (the rate d3 is trained on) and judges windows of `window` frames, half a window apart; a window passes once one of its frames shows it. It then finds each edge to the source frame by sliding the window one source frame at a time.
+**Typed Decision Interval Search**: finds when in a video something one frame can show holds, such as "A dog is visible." It reads the whole video at 2 fps (the rate d3 is trained on) and judges blocks of `window` frames; a block passes once one of its frames shows it, so a block that fails is skipped whole. Blocks pass at half the `threshold`, since a model can score a block with one matching frame below it. It then judges each frame of the blocks that pass, and the source frames between each passing frame and the failing one next to it, so the edges fall on source frames. A gap of one 2 fps frame splits an interval.
 
 - `instructions`, `criteria_true`, `criteria_false`, `state`: as noul in Typed Decision.
-- `window`: frames judged together (default 8, 4 seconds). imajev takes at most 2.
+- `window`: frames judged together at first (default 8, 4 seconds). A larger window skips more at once, but a block with one matching frame scores lower: at 16, d3-mini and d3-flash can drop a half-second event with its block. imajev takes at most 2.
 - The intervals follow the model's answer on single frames: an object half out of the frame may already count as gone. Write the question for what you want to count.
 - Motion, such as which way something moves, is not searched for: a window passes on part of it, and how much depends on the video, so its edges cannot be found.
-- An event shorter than half a second can fall between the 2 fps samples and be missed; when it is found, its edges are rough.
+- Something shown for less than half a second can fall between the 2 fps frames and be missed.
 - d3 sees each frame twice, as a group of its own: it barely sees the second frame of a pair. Clef-flash sees the frames as images. Both see them at d3's video frame size (about 200,000 px a frame).
+- d3-flash does not fit next to other programs on a 12 GB GPU, and each forward then streams its weights: a 30 s video took about 3 minutes, against 43 s on d3-mini and 15 s on d3-lite.
 
 | Output | Meaning |
 | --- | --- |
-| `intervals` | JSON list of `start`, `end` (seconds), `start_frame`, `end_frame` (source frames, end exclusive) and `score` (highest window probability) |
+| `intervals` | JSON list of `start`, `end` (seconds), `start_frame`, `end_frame` (source frames, end exclusive) and `score` (highest probability of its 2 fps frames) |
 | `videos` | The video trimmed to each interval. When nothing is found, the video nodes after it are skipped. |
 
 ## Sample workflows

@@ -1,11 +1,11 @@
 """Interval Search: where in a video a yes/no decision holds, to the source frame.
 
-Stage 1 judges windows of frames read at 2 fps (the rate d3 reads videos at) over the whole video. Stage 2 finds each edge
-of a run of passing windows by sliding a window one source frame at a time, by bisection, between a passing and a failing
-window. A window passes once one of its frames shows what is asked, so questions are about what one frame shows; motion,
-whose edges depend on how much of it a window holds, is not searched for."""
+The video is read at 2 fps (the rate d3 reads videos at) and cut into blocks of `window` samples. A block passes once one
+of its frames shows what is asked, so a block that fails holds nothing and is dropped whole; the samples of a block that
+passes are judged one by one, and the samples that pass make the intervals. Each edge is then found among the source frames
+between a failing and a passing sample. The three steps keep the forwards few, since a model that does not fit in VRAM
+streams its weights for each. Questions are about what one frame shows; motion is not searched for."""
 import json
-import math
 
 import numpy as np
 
@@ -26,67 +26,55 @@ def sample(total, video_fps):
     return np.linspace(0, total - 1, count).round().astype(int).tolist()
 
 
-def windows(n, size):
-    """(start, end) of each window over n samples, half a window apart; the last window ends on the last sample."""
-    if n <= size:
-        return [(0, n)]
-    starts = list(range(0, n - size + 1, max(size // 2, 1)))
-    if starts[-1] != n - size:
-        starts.append(n - size)
-    return [(s, s + size) for s in starts]
+def blocks(n, size):
+    """(start, end) of each block of size samples over n samples, without overlap."""
+    return [(s, min(s + size, n)) for s in range(0, n, size)]
 
 
-def runs(passed):
-    """(first, last) window of each run of passing windows. Windows overlap, so a run covers its samples without a gap."""
+def positives(n, size, judge, threshold):
+    """{sample: value} of the samples that pass alone. judge([(start, end), ...], threshold) -> [(passed, value)] of those
+    sample ranges; it is called for the blocks, then for the samples of the blocks that pass.
+
+    A block only drops what holds nothing, so it passes at half the threshold: a block with one positive sample in it can
+    score below the threshold (d3-flash 0.38 at 8 samples), and a block passed in vain costs only its samples' judgments."""
+    ranges = blocks(n, size)
+    if size == 1:  # the blocks are the samples
+        return {a: value for (a, _), (passed, value) in zip(ranges, judge(ranges, threshold)) if passed}
+    samples = [(i, i + 1) for (a, b), (passed, _) in zip(ranges, judge(ranges, threshold / 2)) if passed for i in range(a, b)]
+    return {a: value for (a, _), (passed, value) in zip(samples, judge(samples, threshold) if samples else []) if passed}
+
+
+def runs(samples):
+    """(first, last) of each run of neighbouring samples, from sorted sample numbers."""
     out = []
-    for i, ok in enumerate(passed):
-        if ok and out and out[-1][1] == i - 1:
+    for i in samples:
+        if out and out[-1][1] == i - 1:
             out[-1] = (out[-1][0], i)
-        elif ok:
+        else:
             out.append((i, i))
     return out
 
 
-def searches(spans, first, last, indices, total):
-    """The start and the end search of the run of passing windows first..last: (frames of the window that slides, shift
-    where it passes, shift where it fails, from_end).
-
-    The start slides the window before the run, which failed, towards the first passing window; the end slides the last
-    passing window towards the window after it. At an end of the video the window slides out of it, where it sees nothing."""
-    if first:
-        before = indices[spans[first - 1][0]:spans[first - 1][1]]
-        start = (before, indices[spans[first][1] - 1] - before[-1], 0, False)  # the samples are uneven: line up the far frames
-    else:
-        seen = indices[spans[0][0]:spans[0][1]]
-        start = (seen, 0, -seen[-1] - 1, False)
-    seen = indices[spans[last][0]:spans[last][1]]
-    end = (seen, 0, indices[spans[last + 1][0]] - seen[0] if last + 1 < len(spans) else total - seen[0], True)
-    return [start, end]
-
-
-def slide(wanted, total, judge):
-    """The shift, by bisection, where each search's window last passes next to where it fails. judge([frames, ...]) ->
-    passes of those windows; frames outside the video are left out, and a window with none fails."""
-    bounds = [[ok, bad] for _, ok, bad, _ in wanted]
-    while open_ := [i for i, (ok, bad) in enumerate(bounds) if abs(ok - bad) > 1]:
-        shifts = [sum(bounds[i]) // 2 for i in open_]
-        shifted = [[f + d for f in wanted[i][0] if 0 <= f + d < total] for i, d in zip(open_, shifts)]
-        kept = [w for w in shifted if w]
-        judged = iter(judge(kept) if kept else [])
-        for i, d, w in zip(open_, shifts, shifted):
-            bounds[i][0 if w and next(judged) else 1] = d
-    return [ok for ok, _ in bounds]
+def edges(searches, judge):
+    """For each (passing sample's frame, failing sample's frame), the last frame of the run of passing frames joined to the
+    passing one, judging every frame between in one call; judge([frame, ...]) -> passes. A failing frame outside the
+    video (-1 or total) is never judged."""
+    between = [list(range(ok - 1, bad, -1)) if bad < ok else list(range(ok + 1, bad)) for ok, bad in searches]  # nearest first
+    wanted = sorted({f for frames_ in between for f in frames_})
+    passed = dict(zip(wanted, judge(wanted) if wanted else []))
+    out = []
+    for (ok, _), frames_ in zip(searches, between):
+        for f in frames_:
+            if not passed[f]:
+                break
+            ok = f
+        out.append(ok)
+    return out
 
 
-def edge(search, shift):
-    """The source frame a search found (from_end: the end, after the last frame): where the far frame of the window meets
-    what is asked."""
-    seen, _, _, from_end = search
-    return seen[0] + shift + 1 if from_end else seen[-1] + shift
-
-
-def decide(model, question, state, threshold, clips, fps, bar):
-    """(passes, values) of each clip ([T, H, W, 3] uint8, `fps` frames a second). d3 sees a clip as a video, the others as images."""
+def decide(model, question, state, threshold, clips, fps, advance):
+    """(passes, values) of each clip ([T, H, W, 3] uint8, `fps` frames a second). d3 sees a clip as a video, the others as images.
+    advance(n) is called as each n clips are judged."""
     passed, values = [], []
     step = max(CHUNK // max(len(clip) for clip in clips), 1)
     for c in range(0, len(clips), step):
@@ -99,7 +87,7 @@ def decide(model, question, state, threshold, clips, fps, bar):
             value, _, _, ok, _, _ = answer(model, question, decision, threshold)
             values.append(value)
             passed.append(ok)
-        bar.update(len(requests))
+        advance(len(requests))
     return passed, values
 
 
@@ -110,16 +98,16 @@ class IntervalSearch(io.ComfyNode):
             node_id="TypedDecisionIntervalSearch",
             display_name="Typed Decision Interval Search",
             category="typed decision",
-            description="Finds the intervals of a video where a yes/no decision holds, to the source frame. It judges windows of frames read at 2 fps over the "
-                        "whole video, then slides the window one source frame at a time to find each edge.",
+            description="Finds the intervals of a video where a yes/no decision holds, to the source frame. It reads the video at 2 fps, judges blocks of frames, "
+                        "then each frame of the blocks that pass, then the source frames around each edge.",
             inputs=[
                 *noul_inputs(),
                 TypedDecisionModel.Input("model"),
                 io.Video.Input("video"),
                 state_input(),
-                io.Int.Input("window", default=8, min=1, max=64, tooltip="Frames judged together, read at 2 fps (8: 4 seconds). A larger window takes fewer "
-                             "judgments for a long video. imajev takes at most 2."),
-                io.Float.Input("threshold", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="A window passes when the probability of yes reaches this."),
+                io.Int.Input("window", default=8, min=1, max=64, tooltip="Frames judged together at first, read at 2 fps (8: 4 seconds). The frames of a block "
+                             "that passes are judged one by one. A larger window can drop a half-second event with its block. imajev takes at most 2."),
+                io.Float.Input("threshold", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="A frame passes when the probability of yes reaches this; a block of frames, at half of it."),
             ],
             outputs=[
                 io.String.Output(display_name="intervals", tooltip="JSON list of {start, end (seconds), start_frame, end_frame (end exclusive), score}."),
@@ -139,27 +127,41 @@ class IntervalSearch(io.ComfyNode):
         resize = lambda frame: d3.resize_frame(frame, 2 * window)  # the size d3 gives a window, which it reads each frame of twice; Clef sees this size too
 
         indices = sample(total, video_fps)
-        spans = windows(len(indices), window)
         u8 = frames.read_frames(video, indices, resize)
         rate = video_fps * (len(indices) - 1) / (indices[-1] - indices[0]) if len(indices) > 1 else video_fps
-        bar = comfy.utils.ProgressBar(len(spans))
-        passed, values = decide(model, question, state, threshold, [u8[s:e] for s, e in spans], rate, bar)
-        found = runs(passed)
+        # a third of the bar for each step: the blocks, their samples, the frames around the edges; the judgments of a step
+        # are known only after the step before
+        bar = comfy.utils.ProgressBar(300)
+        step = [0]
 
-        def judge(windows):  # each round reads only the frames it judges, so memory does not grow with the video
-            near = sorted({f for w in windows for f in w})
-            row = {f: i for i, f in enumerate(near)}
-            source = frames.read_frames(video, near, resize)
-            return decide(model, question, state, threshold, [source[[row[f] for f in w]] for w in windows], rate, bar)[0]
+        def judge(clips, fps, threshold):
+            done = [0]
 
-        wanted = [search for first, last in found for search in searches(spans, first, last, indices, total)]
-        bar.update_absolute(bar.current, len(spans) + sum(math.ceil(math.log2(abs(ok - bad))) for _, ok, bad, _ in wanted))  # one judgment a bisection step
-        bounds = [edge(search, shift) for search, shift in zip(wanted, slide(wanted, total, judge))]
-        bar.update_absolute(bar.total)  # the total counted every bisection step; a search can end in fewer
-        intervals = []
-        for (first, last), start, end in zip(found, bounds[::2], bounds[1::2]):
-            end = max(end, start + 1)  # an event under half a second can end before it starts
-            intervals.append({"start": start / video_fps, "end": end / video_fps, "start_frame": start, "end_frame": end, "score": max(values[first:last + 1])})
+            def advance(n):
+                done[0] += n
+                bar.update_absolute(100 * step[0] + 100 * done[0] // len(clips))
+            out = decide(model, question, state, threshold, clips, fps, advance)
+            step[0] += 1
+            return out
+
+        def judge_samples(ranges, threshold):
+            passed, values = judge([u8[a:b] for a, b in ranges], rate, threshold)
+            return list(zip(passed, values))
+
+        def judge_frames(wanted):  # only the frames around the edges are read again
+            step[0] = 2  # with window 1 there is no step for the samples
+            source = frames.read_frames(video, wanted, resize)
+            return judge([source[i:i + 1] for i in range(len(wanted))], video_fps, threshold)[0]
+
+        found = positives(len(indices), window, judge_samples, threshold)
+        groups = runs(sorted(found))
+        # each run starts after the failing sample before it and ends before the one after it, or at an end of the video
+        searches = [search for first, last in groups for search in ((indices[first], indices[first - 1] if first else -1),
+                                                                     (indices[last], indices[last + 1] if last + 1 < len(indices) else total))]
+        bounds = edges(searches, judge_frames)
+        bar.update_absolute(300)
+        intervals = [{"start": start / video_fps, "end": (end + 1) / video_fps, "start_frame": start, "end_frame": end + 1,
+                      "score": max(found[i] for i in range(first, last + 1))} for (first, last), start, end in zip(groups, bounds[::2], bounds[1::2])]
         # a microsecond short: VideoFromComponents drops a duration that rounds past its end. More would lose the last frame
         # of a file whose trim start falls between frames.
         clips = [video.as_trimmed(f["start"], f["end"] - f["start"] - 1e-6, strict_duration=False) for f in intervals]

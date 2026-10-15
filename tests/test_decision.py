@@ -13,6 +13,7 @@ import safetensors.torch
 import torch
 
 import comfy.model_management
+import comfy.utils
 import comfy.text_encoders.qwen35
 import folder_paths
 from comfy_api.latest import InputImpl, Types, io
@@ -590,55 +591,87 @@ def test_interval_reads_the_video_at_2_fps():
     assert interval.sample(4, 1.0) == [0, 1, 2, 3]  # never more than the video has
 
 
-def test_interval_windows_cover_every_sample_at_half_a_window_apart():
-    assert interval.windows(10, 4) == [(0, 4), (2, 6), (4, 8), (6, 10)]
-    assert interval.windows(9, 4) == [(0, 4), (2, 6), (4, 8), (5, 9)]  # the last window ends on the last sample
-    assert interval.windows(3, 8) == [(0, 3)]
-    assert interval.windows(3, 1) == [(0, 1), (1, 2), (2, 3)]
+def test_interval_blocks_split_the_samples_without_overlap():
+    assert interval.blocks(10, 4) == [(0, 4), (4, 8), (8, 10)]
+    assert interval.blocks(3, 8) == [(0, 3)]
 
 
-def test_interval_runs_of_passing_windows():
-    assert interval.runs([True, True, False, False, True]) == [(0, 1), (4, 4)]
-    assert interval.runs([False, False]) == []
+def existential(truth):
+    """A judge that passes a range of samples when any of them is in truth; records every range it is asked about."""
+    asked = []
+
+    def judge(ranges, threshold):
+        asked.extend(ranges)
+        return [(any(i in truth for i in range(a, b)), 1.0 if any(i in truth for i in range(a, b)) else 0.0) for a, b in ranges]
+    return judge, asked
 
 
-def test_interval_edge_searches_slide_a_window_between_the_failing_and_the_passing_one():
-    indices = [0, 5, 10, 15, 20, 25]  # samples of a 30-frame clip
-    spans = interval.windows(6, 2)  # (0, 2) (1, 3) (2, 4) (3, 5) (4, 6)
-    # windows 2..3 pass: the start slides window 1 (frames 5, 10) towards window 2, 5 frames on; the end slides window 3
-    # (frames 15, 20) towards window 4, 5 frames on
-    assert interval.searches(spans, 2, 3, indices, 30) == [([5, 10], 5, 0, False), ([15, 20], 0, 5, True)]
-    # at the ends of the video the window slides out of it, where it sees nothing
-    assert interval.searches(spans, 0, 4, indices, 30) == [([0, 5], 0, -6, False), ([20, 25], 0, 10, True)]
+def test_interval_finds_every_positive_sample_even_in_gaps_shorter_than_a_block():
+    truth = {33, 34, 35, 41, 42, 49, 50, 51, 52, 53, 54}  # gaps of 5 and 6 samples inside blocks of 8
+    judge, _ = existential(truth)
+    assert set(interval.positives(60, 8, judge, 0.5)) == truth
 
 
-def test_interval_slides_each_window_to_where_it_starts_to_pass():
+def test_interval_positives_match_judging_every_sample_alone():
+    rng = np.random.default_rng(0)
+    for _ in range(300):
+        n, size = int(rng.integers(1, 80)), int(rng.integers(1, 17))
+        truth = {i for i in range(n) if rng.random() < rng.choice([0.05, 0.3, 0.8])}
+        judge, _ = existential(truth)
+        assert set(interval.positives(n, size, judge, 0.5)) == truth, (n, size, truth)
+
+
+def test_interval_positives_judge_blocks_then_the_samples_of_passing_blocks():
+    calls = []
+    judge, asked = existential({5})
+    interval.positives(64, 8, lambda ranges, t: calls.append(len(ranges)) or judge(ranges, t), 0.5)
+    assert calls == [8, 8] and asked[8:] == [(i, i + 1) for i in range(8)]  # two rounds; empty blocks are dropped whole
+
+
+def test_interval_positives_of_single_sample_blocks_take_one_round():
+    calls = []
+    judge, _ = existential({2})
+    assert set(interval.positives(5, 1, lambda ranges, t: calls.append(len(ranges)) or judge(ranges, t), 0.5)) == {2}
+    assert calls == [5]
+
+
+def test_interval_positives_trust_the_samples_over_their_block():
+    judge = lambda ranges, threshold: [(b - a == 8, 0.6) for a, b in ranges]  # every block passes, no sample does
+    assert interval.positives(16, 8, judge, 0.5) == {}
+
+
+def test_interval_blocks_pass_at_half_the_threshold():
+    # a model gives a block with one positive sample in it 0.4, below the threshold, and the sample itself 0.9
+    def judge(ranges, threshold):
+        values = [0.9 if (a, b) == (5, 6) else 0.4 if a <= 5 < b else 0.0 for a, b in ranges]
+        return [(v >= threshold, v) for v in values]
+    assert interval.positives(16, 8, judge, 0.5) == {5: 0.9}
+
+
+def test_interval_positives_keep_the_value_of_each_sample():
+    judge = lambda ranges, threshold: [(True, 0.5 + a / 100) for a, b in ranges]
+    assert interval.positives(3, 2, judge, 0.5) == {0: pytest.approx(0.5), 1: pytest.approx(0.51), 2: pytest.approx(0.52)}
+
+
+def test_interval_runs_of_neighbouring_samples():
+    assert interval.runs([0, 1, 4, 5, 6, 9]) == [(0, 1), (4, 6), (9, 9)]
+    assert interval.runs([]) == []
+
+
+def test_interval_edges_are_the_passing_frames_joined_to_the_sample():
     hits = set(range(13, 31))
-    judge = lambda windows: [any(f in hits for f in w) for w in windows]
-    # the start: [5, 10] sees nothing, [10, 15] sees 13; the end: [20, 25] sees 20, [35, 40] sees nothing
-    assert interval.slide([([5, 10], 5, 0, False), ([20, 25], 0, 15, True)], 50, judge) == [3, 10]
+    calls = []
+    judge = lambda frames_: calls.append(list(frames_)) or [f in hits for f in frames_]
+    # the start lies after the failing sample at frame 5, up to the passing one at 15; the end after 25, before 40
+    assert interval.edges([(15, 5), (25, 40)], judge) == [13, 30]
+    assert calls == [list(range(6, 15)) + list(range(26, 40))]  # every frame between, in one round
+    assert interval.edges([(5, -1), (25, 50)], lambda f: [True] * len(f)) == [0, 49]  # out to the ends of the video
+    assert interval.edges([(0, -1), (49, 50)], lambda f: 1 / 0) == [0, 49]  # nothing between: nothing judged
 
 
-def test_interval_edges_are_exact_where_the_samples_are_uneven():
-    indices = interval.sample(600, 24.0)  # rounded, so 11 or 12 frames apart
-    spans = interval.windows(len(indices), 8)
-    hits = set(range(330, 378))
-    judge = lambda windows: [any(f in hits for f in w) for w in windows]
-    (first, last), = interval.runs(judge([indices[s:e] for s, e in spans]))
-    wanted = interval.searches(spans, first, last, indices, 600)
-    assert [interval.edge(w, d) for w, d in zip(wanted, interval.slide(wanted, 600, judge))] == [330, 378]
-
-
-def test_interval_slides_leave_out_frames_outside_the_video():
-    seen = []
-    judge = lambda windows: seen.extend(windows) or [True] * len(windows)
-    assert interval.slide([([0, 5], 0, -6, False), ([20, 25], 0, 10, True)], 30, judge) == [-5, 9]
-    assert all(0 <= f < 30 for w in seen for f in w) and [] not in seen
-
-
-def test_interval_edge_is_where_the_far_frame_of_the_window_meets_it():
-    # a window passes once one frame shows what is asked: the start is its last frame, the end after its first
-    assert interval.edge(([5, 10], 5, 0, False), 3) == 13 and interval.edge(([20, 25], 0, 15, True), 10) == 31
+def test_interval_edges_stop_at_the_first_failing_frame():
+    hits = {8, 9, 12, 13, 14, 26, 27, 30}  # a pass at 8 or 30 does not join the sample across a failing frame
+    assert interval.edges([(15, 5), (25, 40)], lambda f: [x in hits for x in f]) == [12, 27]
 
 
 class IntervalModel:
@@ -675,9 +708,22 @@ def test_interval_node_finds_each_interval_to_the_source_frame(max_videos):
     intervals, videos = search(model, interval_video())
     assert json.loads(intervals) == [{"start": 2.0, "end": 3.4, "start_frame": 20, "end_frame": 34, "score": pytest.approx(0.9)}]
     assert len(videos) == 1 and videos[0].get_components().images.shape[0] == 14
-    if max_videos:
-        # 12 samples over 59 source frames; the edges slide the same windows, so they are read at the same rate
-        assert [r[1][0].fps for r in model.requests] == [pytest.approx(10 * 11 / 59)] * len(model.requests)
+    if max_videos:  # 12 samples over 59 source frames; the edges are single source frames
+        rate = 10 * 11 / 59
+        assert all(r[1][0].fps == pytest.approx(rate) or (r[1][0].fps == 10.0 and len(r[1][0].frames) == 1) for r in model.requests)
+
+
+def test_interval_node_splits_intervals_at_a_gap_shorter_than_the_window():
+    # samples at 0 5 11 16 21 27 32 38 43 48 54 59; the gap of 27 32 38 lies inside one block of 8
+    intervals, videos = search(IntervalModel(math.inf, hits=set(range(20, 25)) | set(range(40, 45))), interval_video(), window=8)
+    assert [(f["start_frame"], f["end_frame"]) for f in json.loads(intervals)] == [(20, 25), (40, 45)] and len(videos) == 2
+
+
+def test_interval_node_progress_only_moves_forward(monkeypatch):
+    seen = []
+    monkeypatch.setattr(comfy.utils, "PROGRESS_BAR_HOOK", lambda value, total, preview, node_id=None: seen.append((value, total)))
+    search(IntervalModel(math.inf, hits=set(range(20, 25)) | set(range(40, 45))), interval_video(), window=4)
+    assert [v for v, _ in seen] == sorted(v for v, _ in seen) and seen[-1] == (300, 300) and {t for _, t in seen} == {300}
 
 
 def test_interval_node_trims_an_interval_that_reaches_the_end():
