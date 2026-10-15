@@ -79,22 +79,6 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 | `abstained` | The images and state were not enough to answer (imajev; always false for d3 and Clef-flash) |
 | `result` | Full answer as JSON |
 
-**Typed Decision Region Search**: finds where in an image a yes/no decision holds. It is a search over decisions, not an object detector. It judges the whole image; when a tile's probability of yes reaches the threshold (abstaining counts as no), it splits the tile into four and judges each, down to `max_depth`. Each tile is judged together with the crops above it, each with a red box around the next one: a tile alone loses the context that makes a hand part of a person.
-
-- `instructions`, `criteria_true`, `criteria_false`, `state`: as noul in Typed Decision. The node asks about the last crop only and counts what is partly in it.
-- `threshold_top` / `threshold_bottom`: the threshold for the whole image and at `max_depth`, linear in between. Keep the top lenient so small hits are not cut off early.
-- `max_depth`: a tile must still show what is asked. A mosaic is found down to tiles of a few mosaic blocks; tiles of one block look like flat color.
-- `context_margin`: each tile is judged on a crop widened by this fraction of the tile size on every side.
-- imajev takes two images, so it sees the whole image and the tile.
-- Small hits such as a mosaic or a broken hand need d3-flash or d3-mini; d3-lite is too weak for them.
-- A batch is searched image by image. The tiles of one level are judged together.
-
-| Output | Meaning |
-| --- | --- |
-| `mask` | Positive tiles at `max_depth` (or too small to split), filled. A tile that was split counts only through its four tiles. |
-| `bboxes` | Per image, one box around each group of touching positive tiles; `score` is the highest `value` in the group |
-| `heatmap` | The probability of the deepest tile judged at each pixel (white = 1) |
-
 **Typed Decision Interval Search**: finds when in a video something one frame can show holds, such as "A dog is visible." It reads the whole video at 2 fps (the rate d3 is trained on) and judges windows of `window` frames, half a window apart; a window passes once one of its frames shows it. It then finds each edge to the source frame by sliding the window one source frame at a time.
 
 - `instructions`, `criteria_true`, `criteria_false`, `state`: as noul in Typed Decision.
