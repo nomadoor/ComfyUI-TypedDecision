@@ -111,12 +111,12 @@ def decision_folders():
 
 def adapter_options():
     """imajev folders in models/typed_decision, then d3 and clef, whose heads are inside their backbone files."""
-    d3_settings = [io.Boolean.Input("debias", default=False, tooltip="Also score choice options in reverse order and average. Slower."),
-                   io.Float.Input("fps", default=2.0, min=0.01, max=30.0, step=0.1, tooltip="Video frames read per second, over the whole video. "
-                                  "d3 reads videos at 2. All frames go into one request, so long videos are slow; lower it to 1 or 0.5 to make them lighter. "
-                                  "The result JSON tells how many frames were read.")]
+    fps = lambda: io.Float.Input("fps", default=2.0, min=0.01, max=30.0, step=0.1, tooltip="Video frames read per second, over the whole video. "
+                                 "d3 and Clef-flash read videos at 2. All frames go into one request, so long videos are slow; lower it to 1 or 0.5 to "
+                                 "make them lighter. The result JSON tells how many frames were read.")
+    d3_settings = [io.Boolean.Input("debias", default=False, tooltip="Also score choice options in reverse order and average. Slower."), fps()]
     return ([io.DynamicCombo.Option(folder, imajev_settings()) for folder in decision_folders()]
-            + [io.DynamicCombo.Option("d3", d3_settings), io.DynamicCombo.Option("clef", [])])
+            + [io.DynamicCombo.Option("d3", d3_settings), io.DynamicCombo.Option("clef", [fps()])])
 
 
 def imajev_settings():
@@ -186,7 +186,7 @@ class LoadTypedDecisionModel(io.ComfyNode):
         if name == "d3":
             return io.NodeOutput(d3.D3Model(backbone, adapter["debias"], adapter["fps"]))
         if name == "clef":
-            return io.NodeOutput(clef.ClefModel(backbone))
+            return io.NodeOutput(clef.ClefModel(backbone, adapter["fps"]))
         folder = os.path.dirname(folder_paths.get_full_path_or_raise("typed_decision", os.path.join(name, imajev.MARKER)))
         if not imajev.is_imajev(folder):
             raise ValueError(f"{name}: unsupported typed decision model format (expected adapter_config.json, adapter_model.safetensors and decision_readout.*).")
@@ -209,7 +209,7 @@ class TypedDecision(io.ComfyNode):
                     tooltip="Images looked at together, in slot order. imajev: first = reference, second = the one to judge."),
                 io.Autogrow.Input("videos", optional=True, template=io.Autogrow.TemplatePrefix(
                     input=io.Video.Input("video"), prefix="video_", min=0),
-                    tooltip="Videos looked at together with the images, in slot order (d3). Read at the loader's fps over the whole video."),
+                    tooltip="Videos looked at together with the images, in slot order (d3, Clef-flash). Read at the loader's fps over the whole video."),
                 state_input(),
                 io.Float.Input("threshold", default=0.5, min=0.0, max=10.0, step=0.01, tooltip="pass is true when value >= threshold and the model did not abstain."),
             ],

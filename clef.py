@@ -12,6 +12,7 @@ import comfy.model_patcher
 import comfy.sd
 import comfy.text_encoders.qwen35
 
+from .d3 import VIDEO_FPS, hidden, read_video, video_plan
 from .imajev import batches, fit_grid, image_tokens, media_layout, memory_estimation, token_budget
 
 HEAD = "clef_head."  # head weights stored in the converted backbone file next to the Core keys
@@ -22,6 +23,8 @@ NOUL_TEXTS = {True: "The proposition is true or the answer is yes.", False: "The
 TYPES = {"noul": 0, "choice": 1, "score": 2}
 MAX_LENGTH = 16384  # the release's systemone limit; the state is cut to fit
 MAX_PIXELS = 1_638_400  # as d3; the release allows 16,777,216 px (about 16k tokens an image), so larger images differ from it
+VIDEO_MAX_PIXELS = 25_165_824  # over all frames of a video, as the release's video processor
+VIDEO_MIN_PIXELS = 4_096
 
 
 def render(value):
@@ -37,10 +40,12 @@ def options(question):
     return [(i, str(v), d) for i, (v, d) in enumerate(question.answers)]
 
 
-def encode(tokenizer, state, question, images):
-    """-> (Core tokens, (question span, option spans), answer index of each option, token ids of each option).
+def encode(tokenizer, state, question, images, videos=()):
+    """-> (Core tokens, (question span, option spans), answer index of each option, token ids of each option). `videos` holds
+    (frames [T, 3, H, W], group timestamps) of each video.
 
-    The release tokenizes the prompt piece by piece; spans count each image as its expanded tokens."""
+    The release tokenizes the prompt piece by piece; spans count each image and video group as its expanded tokens. Its
+    processor replaces a video's placeholder with a timestamp and a vision block for each group of two frames."""
     ids = lambda text: tokenizer(text, add_special_tokens=False)["input_ids"]
     schema = ids("\n\nSCHEMA FIELDS:\n") + ids(f"\nFIELD 1\nID: {QUESTION_ID}\nTYPE: {question.kind}\nINSTRUCTION: ")
     start = len(schema)
@@ -57,13 +62,16 @@ def encode(tokenizer, state, question, images):
         schema += ids("\n")
     schema += ids("END FIELD\n")
     prefix = ids(f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n")
-    if images:
-        start, end = tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|vision_end|>"])
-        for image in images:
-            prefix += [start, {"type": "image", "data": image, "original_type": "image"}, end]
+    start, end = tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|vision_end|>"])
+    for image in images:
+        prefix += [start, {"type": "image", "data": image, "original_type": "image"}, end]
+    for frames, times in videos:
+        for g, t in enumerate(times):
+            prefix += ids(f"<{t:.1f} seconds>") + [start, {"type": "video", "frames": frames, "group": g, "tokens": frames.shape[2] * frames.shape[3] // 1024}, end]
+    if images or videos:
         prefix += ids("\n")
     suffix = ids("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
-    expanded = len(prefix) + sum(image_tokens(image) - 1 for image in images)
+    expanded = len(prefix) + sum(image_tokens(image) - 1 for image in images) + sum(t["tokens"] - 1 for t in prefix if isinstance(t, dict) and t["type"] == "video")
     fixed = expanded + len(schema) + len(suffix)
     state_ids = ids(render(state if state != {} else ""))[:max(0, MAX_LENGTH - fixed)]  # the release refuses when fixed > limit
     shift = expanded + len(state_ids)
@@ -78,6 +86,22 @@ def restore(order, probabilities):
     for answer, p in zip(order, probabilities):
         scores[answer] = p
     return scores
+
+
+def video_size(width, height, n_frames):
+    """(width, height) of each frame of an n_frames video after the release's video processor: a pixel budget over the
+    whole video (two frames a temporal patch), on a 32-pixel grid."""
+    if height < 32 or width < 32:
+        raise ValueError(f"Video frames must be at least 32 pixels on each side; got {width} x {height}.")
+    h, w = round(height / 32) * 32, round(width / 32) * 32
+    t = math.ceil(n_frames / 2) * 2
+    if t * h * w > VIDEO_MAX_PIXELS:
+        beta = math.sqrt(n_frames * height * width / VIDEO_MAX_PIXELS)
+        h, w = max(32, math.floor(height / beta / 32) * 32), max(32, math.floor(width / beta / 32) * 32)
+    elif t * h * w < VIDEO_MIN_PIXELS:
+        beta = math.sqrt(VIDEO_MIN_PIXELS / (n_frames * height * width))
+        h, w = math.ceil(height * beta / 32) * 32, math.ceil(width * beta / 32) * 32
+    return w, h
 
 
 def read_head(path):
@@ -164,11 +188,12 @@ class JointSchemaHead(torch.nn.Module):
 
 class ClefModel:
     max_images = math.inf
-    max_videos = 0
+    max_videos = math.inf
     max_options = math.inf
     max_levels = math.inf
 
-    def __init__(self, backbone_path):
+    def __init__(self, backbone_path, fps=VIDEO_FPS):
+        self.fps = fps
         weights, config = read_head(backbone_path)
         head = JointSchemaHead(**config)
         head.load_state_dict(weights)
@@ -178,7 +203,6 @@ class ClefModel:
         self.name = self.clip.cond_stage_model.clip_name
         self.encoder = getattr(self.clip.cond_stage_model, self.name)
         self.clip.cond_stage_model.memory_estimation_function = memory_estimation(self.encoder.transformer.model.config.hidden_size)
-        self.clip.clip_layer([self.encoder.num_layers])  # the layer after the last block: the final-normed hidden state
         self.pad = self.encoder.special_tokens["pad"]
         self.tokenizer = getattr(self.clip.tokenizer, self.name).tokenizer
         self.head = comfy.model_patcher.ModelPatcher(head.float(), load_device=self.clip.patcher.load_device,
@@ -189,34 +213,43 @@ class ClefModel:
         """The probability of the chosen answer, as the release reports it."""
         return max(known)
 
+    def video_plan(self, video):
+        """(source frame indices, fps) this model reads from a VIDEO."""
+        return video_plan(video, self.fps)
+
+    def prepare_video(self, video):
+        return read_video(video, self.fps, video_size)
+
     def decide(self, images, videos, state, question):
         """-> (probabilities over answers, unknown probability (None), abstained (False), calibration version (None))."""
         return self.decide_many([(images, videos, state, question)])[0]
 
     def decide_many(self, requests):
-        """decide for each (images, videos, state, question); Clef takes no videos yet. Requests of the same media layout
-        share backbone forwards."""
-        rows = []  # (images, question, tokens, spans, order, option ids, length)
-        for images, _, state, question in requests:
-            images = [prepare_image(image) for image in images]
-            tokens, spans, order, option_ids = encode(self.tokenizer, state, question, images)
+        """decide for each (images, videos, state, question). Requests of the same media layout share backbone forwards,
+        which run Core's blocks causally as Core's encode does; Core's encode takes no videos."""
+        rows = []  # (images, videos, question, tokens, spans, order, option ids, length)
+        for images, videos, state, question in requests:
+            images, videos = [prepare_image(image) for image in images], [self.prepare_video(video) for video in videos]
+            tokens, spans, order, option_ids = encode(self.tokenizer, state, question, images, videos)
             if self.pad in tokens:  # Core masks everything after the pad token
                 raise ValueError("The text must not contain <|endoftext|>.")
-            rows.append((images, question, tokens, spans, order, option_ids, sum(image_tokens(t["data"]) if isinstance(t, dict) else 1 for t in tokens)))
-        hidden = [None] * len(rows)
+            rows.append((images, videos, question, tokens, spans, order, option_ids,
+                         sum(1 if not isinstance(t, dict) else t["tokens"] if t["type"] == "video" else image_tokens(t["data"]) for t in tokens)))
+        # Positions follow the media and the timestamp text between video groups, so both are part of the layout.
+        layouts = [(media_layout(row[0]), tuple((tuple(v.shape), tuple(f"{t:.1f}" for t in times)) for v, times in row[1])) for row in rows]
+        states = [None] * len(rows)
         budget = token_budget(self.clip.patcher, self.encoder.transformer.model.config.hidden_size)
-        for batch in batches([media_layout(row[0]) for row in rows], [row[-1] for row in rows], budget):
-            longest = max(len(rows[i][2]) for i in batch)
-            cond = self.clip.encode_from_tokens({self.name: [[(t, 1.0) for t in rows[i][2]] + [(self.pad, 1.0)] * (longest - len(rows[i][2])) for i in batch]})
-            cond = cond.reshape(len(batch), -1, cond.shape[-1])
+        for batch in batches(layouts, [row[-1] for row in rows], budget):
+            longest = max(len(rows[i][3]) for i in batch)
+            cond = hidden(self.clip, self.name, [rows[i][3] + [self.pad] * (longest - len(rows[i][3])) for i in batch], causal=True)
             for k, i in enumerate(batch):  # a copy of the record's own tokens, so the padded batch output is freed
-                hidden[i] = cond[k, :rows[i][-1]].to(self.clip.patcher.offload_device, copy=True)
+                states[i] = cond[k, :rows[i][-1]].to(self.clip.patcher.offload_device, copy=True)
         # The head runs after every backbone forward: both rarely fit in VRAM together, so it loads once.
         lm_head = self.encoder.transformer.model.lm_head.weight
         comfy.model_management.load_models_gpu([self.head], force_full_load=True)
         device = self.head.load_device
         out = []
-        for (_, question, _, (question_span, option_spans), order, option_ids, _), h in zip(rows, hidden):
+        for (_, _, question, _, (question_span, option_spans), order, option_ids, _), h in zip(rows, states):
             lexical = torch.stack([lm_head[ids].float().mean(dim=0) for ids in option_ids])
             logits = self.head.model(h.to(device), question_span, option_spans, question.kind, lexical.to(device))
             out.append((restore(order, torch.softmax(logits, dim=-1).tolist()), None, False, None))

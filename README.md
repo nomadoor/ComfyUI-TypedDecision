@@ -59,7 +59,7 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 **Load Typed Decision Model**: for imajev, pick Qwen3.5 as `backbone` and imajev-4b as `adapter`. For d3 and Clef-flash, pick the model file as `backbone` and `d3` or `clef` as `adapter`. The model's own settings appear under `adapter`:
 
 - `debias`: average over several option orders (slower). d3 also scores choice options in reverse order.
-- `fps` (d3): video frames read per second, over the whole video (default 2, as d3 reads videos).
+- `fps` (d3, Clef-flash): video frames read per second, over the whole video (default 2, as both read videos).
 - `calibration` (imajev): apply the model's temperature calibration
 
 **Typed Decision**: answers one question. Write questions and options in English.
@@ -67,7 +67,7 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 - `mode`: `noul`, `choice` or `score`
 - `instructions` / `criteria`: the question, and the options or levels, one per line. noul takes optional `criteria_true` / `criteria_false` for when to answer yes or no.
 - `images`: imajev takes up to 2 (with two, the first is the reference and the second is the one to judge); d3 and Clef-flash take any number.
-- `videos` (d3): any number of videos, read at the loader's `fps` over the whole video. All the frames go into one request: a minute of video at 2 fps is 120 frames, and long videos get slow quickly, so lower `fps` for them. Only the frames read are kept in memory. The `result` JSON lists how many frames were read and how far apart they are.
+- `videos` (d3, Clef-flash): any number of videos, read at the loader's `fps` over the whole video. All the frames go into one request: a minute of video at 2 fps is 120 frames, and long videos get slow quickly on d3, so lower `fps` for them. Clef-flash shares one pixel budget among a video's frames, as its release does, so a long video is read at a smaller size instead. Only the frames read are kept in memory. The `result` JSON lists how many frames were read and how far apart they are.
 - `state`: optional facts to judge against, as text or JSON
 
 | Output | Meaning |
@@ -86,7 +86,7 @@ Clef-flash is a full fine-tune of Qwen3.5-9B with a small joint schema head. Eac
 - The intervals follow the model's answer on single frames: an object half out of the frame may already count as gone. Write the question for what you want to count.
 - Motion, such as which way something moves, is not searched for: a window passes on part of it, and how much depends on the video, so its edges cannot be found.
 - Something shown for less than half a second can fall between the 2 fps frames and be missed.
-- d3 sees each frame twice, as a group of its own: it barely sees the second frame of a pair. Clef-flash sees the frames as images. Both see them at d3's video frame size (about 200,000 px a frame).
+- d3 and Clef-flash see each frame twice, as a group of its own: d3 barely sees the second frame of a pair. Frames are read at d3's video frame size (about 200,000 px a frame).
 - d3-flash does not fit next to other programs on a 12 GB GPU, and each forward then streams its weights: a 30 s video took about 3 minutes, against 43 s on d3-mini and 15 s on d3-lite.
 
 | Output | Meaning |

@@ -17,6 +17,7 @@ import comfy.utils
 import comfy.text_encoders.qwen35
 import folder_paths
 from comfy_api.latest import InputImpl, Types, io
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize as qwen3_vl_smart_resize  # Clef's release processor
 from typed_decision import clef, d3, frames, imajev, interval, nodes
 from comfy_execution.graph_utils import ExecutionBlocker
 from typed_decision.imajev import (MAX_BATCH_TOKENS, ImajevModel, Question, batches, memory_estimation, token_budget, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
@@ -224,7 +225,7 @@ def test_load_node_offers_each_model_folder_with_its_settings(monkeypatch):
     adapter = schema_inputs(LoadTypedDecisionModel)["adapter"]
     assert isinstance(adapter, io.DynamicCombo.Input)
     settings = {o.key: {i.id: i.default for i in o.inputs} for o in adapter.options}
-    assert settings == {"imajev-4b": {"debias": False, "calibration": True}, "d3": {"debias": False, "fps": 2.0}, "clef": {}}
+    assert settings == {"imajev-4b": {"debias": False, "calibration": True}, "d3": {"debias": False, "fps": 2.0}, "clef": {"fps": 2.0}}
 
 
 def test_decision_node_keeps_only_question_inputs():
@@ -353,6 +354,62 @@ def test_clef_images_go_after_state_header_and_shift_spans():
         hf.convert_tokens_to_ids("<|vision_start|>"), "IMG", hf.convert_tokens_to_ids("<|vision_end|>"), hf("\n")["input_ids"][0]]
 
 
+def test_clef_video_groups_match_the_release_processor():
+    # official encode_record with the release processor: a 4-frame 64 x 96 video at 2 fps, frames 0 to 3
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    state, question, *_ = CLEF_CASES[0]
+    video = (torch.zeros(4, 3, 64, 96), [0.25, 1.25])
+    tokens, spans, _, _ = clef.encode(hf, state, question, [], [video])
+    video_pad = hf.convert_tokens_to_ids("<|video_pad|>")
+    ids = [i for t in tokens for i in ([video_pad] * t["tokens"] if isinstance(t, dict) else [t])]
+    assert len(ids) == 153 and spans == ((95, 98), [(109, 119), (125, 131)])
+    assert hashlib.sha256(str(ids).encode()).hexdigest()[:16] == "67357828346ceab7"
+    assert [t["group"] for t in tokens if isinstance(t, dict)] == [0, 1]
+
+
+def test_clef_reads_videos_like_d3_at_its_own_frame_size():
+    model = clef.ClefModel.__new__(clef.ClefModel)
+    model.fps = 2.0
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=torch.zeros(8, 360, 640, 3), frame_rate=Fraction(4)))
+    frames_, times = model.prepare_video(video)
+    assert model.video_plan(video) == ([0, 2, 5, 7], 4.0)  # 2 per second, at least 4
+    assert frames_.shape == (4, 3, 352, 640) and clef.video_size(640, 360, 4) == (640, 352) and times == [0.25, 1.5]
+    clip = frames.Clip(torch.zeros(3, 64, 64, 3, dtype=torch.uint8), 2.0)
+    frames_, times = model.prepare_video(clip)
+    assert frames_.shape == (6, 3, 64, 64) and times == [0.0, 0.5, 1.0]  # a Clip: each frame a group of its own, as d3
+
+
+def test_clef_sizes_an_odd_video_by_its_frames_before_the_last_one_repeats(monkeypatch):
+    monkeypatch.setattr(clef, "VIDEO_MAX_PIXELS", 100_000)  # 13 frames of 160 x 128 go over it, so the size depends on the count
+    model = clef.ClefModel.__new__(clef.ClefModel)
+    model.fps = 2.0
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=torch.zeros(13, 128, 160, 3), frame_rate=Fraction(2)))
+    frames_, _ = model.prepare_video(video)
+    h, w = qwen3_vl_smart_resize(13, 128, 160, temporal_factor=2, factor=32, min_pixels=4096, max_pixels=100_000)
+    assert frames_.shape == (14, 3, h, w) and (h, w) != qwen3_vl_smart_resize(14, 128, 160, temporal_factor=2, factor=32, min_pixels=4096, max_pixels=100_000)
+
+
+def test_clef_runs_core_blocks_causally_with_its_videos(monkeypatch):
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    model = clef.ClefModel.__new__(clef.ClefModel)
+    model.tokenizer, model.pad, model.fps, model.name = hf, 248044, 2.0, "qwen35_4b"
+    lm_head = types.SimpleNamespace(weight=torch.zeros(250000, 4))
+    model.encoder = types.SimpleNamespace(transformer=types.SimpleNamespace(model=types.SimpleNamespace(config=types.SimpleNamespace(hidden_size=4), lm_head=lm_head)))
+    model.clip = types.SimpleNamespace(patcher=types.SimpleNamespace(load_device=torch.device("cpu"), offload_device=torch.device("cpu"), model_size=lambda: 0))
+    model.head = types.SimpleNamespace(load_device=torch.device("cpu"), model=lambda h, q, options, kind, lexical: torch.zeros(len(options)))
+    monkeypatch.setattr(comfy.model_management, "load_models_gpu", lambda *a, **k: None)
+    calls = []
+
+    def hidden(clip, name, prompts, causal):
+        calls.append((causal, [sum(1 for t in p if isinstance(t, dict) and t["type"] == "video") for p in prompts]))
+        return torch.zeros(len(prompts), max(len(p) for p in prompts) * 64, 4)
+    monkeypatch.setattr(clef, "hidden", hidden)
+    q = Question("noul", "It moves.", [(True, None), (False, None)])
+    clip = frames.Clip(torch.zeros(2, 64, 64, 3, dtype=torch.uint8), 2.0)
+    out = model.decide_many([([], [clip], "", q), ([torch.zeros(64, 64, 3)], [], "", q)])
+    assert len(out) == 2 and sorted(calls) == [(True, [0]), (True, [2])]  # two groups for the clip's two frames; images go the same way
+
+
 def test_clef_long_state_is_cut_to_the_release_limit():
     hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
     tokens, spans, _, option_ids = clef.encode(hf, "word " * 20000, CLEF_CASES[0][1], [torch.zeros(1, 64, 96, 3)])
@@ -394,6 +451,12 @@ def test_clef_image_grid_uses_the_pixel_budget():
     out = clef.prepare_image(torch.rand(4400, 4000, 3))
     _, h, w, _ = out.shape
     assert h * w <= clef.MAX_PIXELS and (w, h) == grid_size(4000, 4400, clef.MAX_PIXELS)
+
+
+@pytest.mark.parametrize("width, height, frames_", [(1920, 1080, 8), (1920, 1080, 768), (1080, 1920, 3), (640, 360, 4), (96, 64, 4), (4000, 3000, 2)])
+def test_clef_video_size_is_the_release_processor_resize(width, height, frames_):
+    h, w = qwen3_vl_smart_resize(frames_, height, width, temporal_factor=2, factor=32, min_pixels=4096, max_pixels=25_165_824)
+    assert clef.video_size(width, height, frames_) == (w, h)
 
 
 def test_batches_share_one_media_layout_and_a_token_budget():

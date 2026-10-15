@@ -73,7 +73,7 @@ def edges(searches, judge):
 
 
 def decide(model, question, state, threshold, clips, fps, advance):
-    """(passes, values) of each clip ([T, H, W, 3] uint8, `fps` frames a second). d3 sees a clip as a video, the others as images.
+    """(passes, values) of each clip ([T, H, W, 3] uint8, `fps` frames a second). Models that take videos see a clip as one, imajev as images.
     advance(n) is called as each n clips are judged."""
     passed, values = [], []
     step = max(CHUNK // max(len(clip) for clip in clips), 1)
