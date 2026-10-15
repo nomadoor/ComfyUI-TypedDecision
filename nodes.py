@@ -155,6 +155,16 @@ def mode_input():
     ], tooltip="noul: true or false. choice: pick one option. score: rate on ordered levels. Write in English.")
 
 
+def images_input(tooltip="Images looked at together, in slot order. imajev: first = reference, second = the one to judge."):
+    return io.Autogrow.Input("images", optional=True, template=io.Autogrow.TemplatePrefix(input=io.Image.Input("image"), prefix="image_", min=0),
+                             tooltip=tooltip)
+
+
+def in_slots(items):
+    """The connected values of an Autogrow input, in slot order."""
+    return [value for _, value in sorted((items or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[1])) if value is not None]
+
+
 def state_input():
     return io.String.Input("state", multiline=True, default="",
                            placeholder="state: the facts to judge against (optional). Plain text or JSON.\ne.g. full body shot of a knight standing in a castle hall",
@@ -204,9 +214,7 @@ class TypedDecision(io.ComfyNode):
             inputs=[
                 mode_input(),
                 TypedDecisionModel.Input("model"),
-                io.Autogrow.Input("images", optional=True, template=io.Autogrow.TemplatePrefix(
-                    input=io.Image.Input("image"), prefix="image_", min=0),
-                    tooltip="Images looked at together, in slot order. imajev: first = reference, second = the one to judge."),
+                images_input(),
                 io.Autogrow.Input("videos", optional=True, template=io.Autogrow.TemplatePrefix(
                     input=io.Video.Input("video"), prefix="video_", min=0),
                     tooltip="Videos looked at together with the images, in slot order (d3, Clef-flash). Read at the loader's fps over the whole video."),
@@ -226,9 +234,8 @@ class TypedDecision(io.ComfyNode):
 
     @classmethod
     def execute(cls, mode, model, state, threshold, images=None, videos=None):
-        slot = lambda item: int(item[0].rsplit("_", 1)[1])
-        frames = [batch[i] for _, batch in sorted((images or {}).items(), key=slot) if batch is not None for i in range(batch.shape[0])]
-        clips = [video for _, video in sorted((videos or {}).items(), key=slot) if video is not None]
+        frames = [batch[i] for batch in in_slots(images) for i in range(batch.shape[0])]
+        clips = in_slots(videos)
         question = question_from_mode(mode)
         check_limits(model, question, len(frames), len(clips))
         notes = None

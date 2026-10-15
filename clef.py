@@ -13,7 +13,7 @@ import comfy.sd
 import comfy.text_encoders.qwen35
 
 from .d3 import VIDEO_FPS, hidden, read_video, video_plan
-from .imajev import batches, fit_grid, image_tokens, media_layout, memory_estimation, token_budget
+from .imajev import batches, fit_grid, image_tokens, media_layout, memory_estimation, once_per_image, token_budget
 
 HEAD = "clef_head."  # head weights stored in the converted backbone file next to the Core keys
 CONFIG = "clef_head_config"  # safetensors metadata: the release's joint_head_config.json
@@ -228,8 +228,9 @@ class ClefModel:
         """decide for each (images, videos, state, question). Requests of the same media layout share backbone forwards,
         which run Core's blocks causally as Core's encode does; Core's encode takes no videos."""
         rows = []  # (images, videos, question, tokens, spans, order, option ids, length)
+        prepare = once_per_image(prepare_image)
         for images, videos, state, question in requests:
-            images, videos = [prepare_image(image) for image in images], [self.prepare_video(video) for video in videos]
+            images, videos = [prepare(image) for image in images], [self.prepare_video(video) for video in videos]
             tokens, spans, order, option_ids = encode(self.tokenizer, state, question, images, videos)
             if self.pad in tokens:  # Core masks everything after the pad token
                 raise ValueError("The text must not contain <|endoftext|>.")

@@ -178,6 +178,17 @@ def token_budget(patcher, hidden_size):
     return MAX_BATCH_TOKENS if free <= 0 else int(min(MAX_BATCH_TOKENS, free // (hidden_size * ACTIVATION_BYTES)))
 
 
+def once_per_image(prepare):
+    """prepare, run once for each image object within one decide_many call: requests often share their reference images."""
+    done = {}
+
+    def run(image):
+        if id(image) not in done:
+            done[id(image)] = prepare(image)
+        return done[id(image)]
+    return run
+
+
 def media_layout(images):
     return tuple(tuple(image.shape[1:3]) for image in images)
 
@@ -263,7 +274,8 @@ class ImajevModel:
 
     def decide_many(self, requests):
         """decide for each (images, videos, state, question); imajev takes no videos. Rows of the same media layout share forwards."""
-        requests = [([prepare_image(image) for image in images], state, question) for images, _, state, question in requests]
+        prepare = once_per_image(prepare_image)
+        requests = [([prepare(image) for image in images], state, question) for images, _, state, question in requests]
         rows = []  # (request, offset, tokens, length)
         for r, (images, state, question) in enumerate(requests):
             n = len(question.answers) + 1

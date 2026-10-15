@@ -483,6 +483,21 @@ def test_d3_decide_many_runs_each_media_layout_in_its_own_forward():
     small, wide = torch.zeros(64, 64, 3), torch.zeros(64, 256, 3)
     out = model.decide_many([([small], [], {}, q), ([wide], [], {}, q), ([small], [], {}, q), ([], [], "text", q)])
     assert len(out) == 4 and sorted(forwards) == [1, 1, 2]
+def test_d3_prepares_an_image_shared_by_requests_once(monkeypatch):
+    hf = comfy.text_encoders.qwen35.tokenizer("qwen35_4b")().qwen35_4b.tokenizer
+    model = d3.D3Model.__new__(d3.D3Model)
+    model.tokenizer, model.pad, model.debias, model.temperature = hf, 248044, False, 1.0
+    model.codes, model.readout, model.hidden_size = ["A", "B"], torch.eye(2, 4), 4
+    model.clip = types.SimpleNamespace(patcher=types.SimpleNamespace(load_device=torch.device("cpu"), model_size=lambda: 0))
+    model.hidden = lambda prompts: torch.zeros(len(prompts), max(sum(64 if isinstance(t, dict) else 1 for t in p) for p in prompts), 4)
+    prepared = []
+    monkeypatch.setattr(d3, "prepare_image", lambda image: prepared.append(image) or image[None])
+    reference = torch.zeros(64, 64, 3)
+    q = Question("noul", "S", [(True, None), (False, None)])
+    model.decide_many([([reference, torch.zeros(64, 64, 3)], [], "", q) for _ in range(3)])
+    assert len(prepared) == 1 + 3  # the shared reference once, each request's own image once
+
+
 def test_memory_estimation_counts_the_padded_batch_with_image_tokens():
     image = torch.zeros(1, 64, 96, 3)  # 6 image tokens
     tokens = {"qwen35_4b": [[(1, 1.0), ({"type": "image", "data": image}, 1.0), (2, 1.0)], [(1, 1.0), (2, 1.0), (3, 1.0)]]}
@@ -761,8 +776,8 @@ def interval_video(n=60):
     return InputImpl.VideoFromComponents(Types.VideoComponents(images=images, frame_rate=Fraction(10)))
 
 
-def search(model, video, window=2, threshold=0.5):
-    return interval.IntervalSearch.execute(model=model, video=video, instructions="It moves.", state="", window=window, threshold=threshold).result
+def search(model, video, window=2, threshold=0.5, images=None):
+    return interval.IntervalSearch.execute(model=model, video=video, instructions="It moves.", state="", window=window, threshold=threshold, images=images).result
 
 
 @pytest.mark.parametrize("max_videos", [math.inf, 0])
@@ -811,10 +826,42 @@ def test_interval_node_blocks_video_nodes_when_nothing_is_found():
     assert json.loads(intervals) == [] and len(videos) == 1 and isinstance(videos[0], ExecutionBlocker)
 
 
+@pytest.mark.parametrize("max_videos", [math.inf, 0])
+def test_interval_node_without_images_judges_the_frames_alone(max_videos):
+    model = IntervalModel(max_videos, hits=set(range(20, 34)))
+    search(model, interval_video(), window=2)
+    if max_videos:
+        assert all(images == [] and len(videos) == 1 for images, videos, *_ in model.requests)
+    else:
+        assert all(1 <= len(images) <= 2 and videos == [] for images, videos, *_ in model.requests)
+
+
+@pytest.mark.parametrize("max_videos", [math.inf, 0])
+def test_interval_node_shows_every_judgment_the_reference_images(max_videos):
+    model = IntervalModel(max_videos, hits=set(range(20, 34)))
+    reference = torch.full((2, 64, 64, 3), 0.5)  # two images in one slot, brightness 50: never a hit
+    intervals, _ = search(model, interval_video(), window=1 if not max_videos else 2, images={"image_0": reference})
+    assert [(f["start_frame"], f["end_frame"]) for f in json.loads(intervals)] == [(20, 34)]
+    assert all(len(images) >= 2 and all(torch.equal(i, r) for i, r in zip(images[:2], reference)) for images, *_ in model.requests)
+    if max_videos:
+        assert all(len(images) == 2 and len(videos) == 1 for images, videos, *_ in model.requests)
+    else:  # window 1: the two references, then the frame
+        assert all(len(images) == 3 for images, *_ in model.requests)
+
+
+def test_interval_node_counts_the_reference_images_against_the_image_limit():
+    model = IntervalModel(0, hits=set())  # takes at most 4 images, as frames
+    with pytest.raises(ValueError, match="at most 4 images"):
+        search(model, interval_video(), window=2, images={"image_0": torch.zeros(3, 8, 8, 3)})
+
+
 def test_interval_node_asks_noul_only():
     inputs = schema_inputs(interval.IntervalSearch)
     # in Typed Decision's order: the question, the model, the media, the state
-    assert list(inputs) == ["instructions", "criteria_true", "criteria_false", "model", "video", "state", "window", "threshold"]
+    assert list(inputs) == ["instructions", "criteria_true", "criteria_false", "model", "images", "video", "state", "window", "threshold"]
+    strip = lambda i: {k: v for k, v in i.as_dict().items() if k != "tooltip"}
+    assert strip(inputs["images"]) == strip(schema_inputs(TypedDecision)["images"])
+    assert "before every" in inputs["images"].as_dict()["tooltip"]
     assert [i.as_dict() for i in inputs.values()][:3] == [i.as_dict() for i in nodes.noul_inputs()]
 
 

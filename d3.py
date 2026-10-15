@@ -15,7 +15,7 @@ import comfy.text_encoders.qwen_vl
 from comfy.ldm.modules.attention import optimized_attention_for_device
 
 from . import frames
-from .imajev import PATCH, batches, fit_grid, grid_size, image_tokens, media_layout, memory_estimation, token_budget, tokenize
+from .imajev import PATCH, batches, fit_grid, grid_size, image_tokens, media_layout, memory_estimation, once_per_image, token_budget, tokenize
 
 READOUT = "d3_readout.weight"  # stored in the converted backbone file next to the Core keys
 CONFIG = "d3_decision_config"  # safetensors metadata: the package's decision_config.json
@@ -253,7 +253,8 @@ class D3Model:
 
     def decide_many(self, requests):
         """decide for each (images, videos, state, question); rows of the same media layout share forwards."""
-        requests = [([prepare_image(image) for image in images], [self.prepare_video(video) for video in videos], state, question)
+        prepare = once_per_image(prepare_image)
+        requests = [([prepare(image) for image in images], [self.prepare_video(video) for video in videos], state, question)
                     for images, videos, state, question in requests]
         rows = []  # (request, order, tokens, length)
         for r, (images, videos, state, question) in enumerate(requests):

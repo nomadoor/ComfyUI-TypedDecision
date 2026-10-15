@@ -15,7 +15,7 @@ from comfy_api.latest import io
 from comfy_execution.graph_utils import ExecutionBlocker
 
 from . import d3, frames
-from .nodes import TypedDecisionModel, answer, check_limits, noul_inputs, parse_state, question_from_mode, state_input
+from .nodes import TypedDecisionModel, answer, check_limits, images_input, in_slots, noul_inputs, parse_state, question_from_mode, state_input
 
 CHUNK = 128  # frames per decide_many call; the frames of one chunk are held in float at a time
 
@@ -72,17 +72,18 @@ def edges(searches, judge):
     return out
 
 
-def decide(model, question, state, threshold, clips, fps, advance):
-    """(passes, values) of each clip ([T, H, W, 3] uint8, `fps` frames a second). Models that take videos see a clip as one, imajev as images.
+def decide(model, question, state, threshold, clips, fps, advance, references):
+    """(passes, values) of each clip ([T, H, W, 3] uint8, `fps` frames a second), judged after the reference images. Models
+    that take videos see a clip as one, imajev as images.
     advance(n) is called as each n clips are judged."""
     passed, values = [], []
     step = max(CHUNK // max(len(clip) for clip in clips), 1)
     for c in range(0, len(clips), step):
         comfy.model_management.throw_exception_if_processing_interrupted()
         if model.max_videos > 0:
-            requests = [([], [frames.Clip(clip, fps)], state, question) for clip in clips[c:c + step]]
+            requests = [(references, [frames.Clip(clip, fps)], state, question) for clip in clips[c:c + step]]
         else:
-            requests = [(list(clip.float() / 255.0), [], state, question) for clip in clips[c:c + step]]
+            requests = [(references + list(clip.float() / 255.0), [], state, question) for clip in clips[c:c + step]]
         for decision in model.decide_many(requests):
             value, _, _, ok, _, _ = answer(model, question, decision, threshold)
             values.append(value)
@@ -103,6 +104,8 @@ class IntervalSearch(io.ComfyNode):
             inputs=[
                 *noul_inputs(),
                 TypedDecisionModel.Input("model"),
+                images_input("Reference images, in slot order, seen before every window of the video, e.g. a person to find. imajev takes "
+                             "2 images in all: one reference and window 1."),
                 io.Video.Input("video"),
                 state_input(),
                 io.Int.Input("window", default=8, min=1, max=64, tooltip="Frames judged together at first, read at 2 fps (8: 4 seconds). The frames of a block "
@@ -116,9 +119,10 @@ class IntervalSearch(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, video, instructions, state, window, threshold, criteria_true="", criteria_false=""):
+    def execute(cls, model, video, instructions, state, window, threshold, criteria_true="", criteria_false="", images=None):
         question = question_from_mode({"mode": "noul", "instructions": instructions, "criteria_true": criteria_true, "criteria_false": criteria_false})
-        check_limits(model, question, 0 if model.max_videos > 0 else window, 1 if model.max_videos > 0 else 0)
+        references = [batch[i] for batch in in_slots(images) for i in range(batch.shape[0])]
+        check_limits(model, question, len(references) + (0 if model.max_videos > 0 else window), 1 if model.max_videos > 0 else 0)
         state = parse_state(state)
         total = frames.frame_count(video)
         if total == 0:
@@ -140,7 +144,7 @@ class IntervalSearch(io.ComfyNode):
             def advance(n):
                 done[0] += n
                 bar.update_absolute(100 * step[0] + 100 * done[0] // len(clips))
-            out = decide(model, question, state, threshold, clips, fps, advance)
+            out = decide(model, question, state, threshold, clips, fps, advance, references)
             step[0] += 1
             return out
 
