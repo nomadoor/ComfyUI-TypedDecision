@@ -1,4 +1,4 @@
-"""Interval Search: where in a video a yes/no decision holds, to the source frame.
+"""Moment Search: where in a video a yes/no decision holds, to the source frame.
 
 The video is read at 2 fps (the rate d3 reads videos at) and cut into blocks of `window` samples. A block passes once one
 of its frames shows what is asked, so a block that fails holds nothing and is dropped whole; the samples of a block that
@@ -92,12 +92,12 @@ def decide(model, question, state, threshold, clips, fps, advance, references):
     return passed, values
 
 
-class IntervalSearch(io.ComfyNode):
+class MomentSearch(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="TypedDecisionIntervalSearch",
-            display_name="Typed Decision Interval Search",
+            node_id="TypedDecisionMomentSearch",
+            display_name="Typed Decision Moment Search",
             category="typed decision",
             description="Finds the intervals of a video where a yes/no decision holds, to the source frame. It reads the video at 2 fps, judges blocks of frames, "
                         "then each frame of the blocks that pass, then the source frames around each edge.",

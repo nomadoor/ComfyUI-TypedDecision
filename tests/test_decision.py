@@ -18,7 +18,7 @@ import comfy.text_encoders.qwen35
 import folder_paths
 from comfy_api.latest import InputImpl, Types, io
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize as qwen3_vl_smart_resize  # Clef's release processor
-from typed_decision import clef, d3, frames, imajev, interval, nodes
+from typed_decision import clef, d3, frames, imajev, moment, nodes
 from comfy_execution.graph_utils import ExecutionBlocker
 from typed_decision.imajev import (MAX_BATCH_TOKENS, ImajevModel, Question, batches, memory_estimation, token_budget, build_prompt, combine_rotations, downscale, grid_size, lora_to_comfy, prepare_image,
                     render, rotation_offsets, select, temperature, tokenize)
@@ -663,15 +663,15 @@ def test_decision_node_reports_the_video_frames_it_read():
     assert json.loads(out.result[5])["videos"] == [{"frames": 3, "interval": 0.5}]
 
 
-def test_interval_reads_the_video_at_2_fps():
-    assert interval.sample(20, 10.0) == [0, 6, 13, 19]
-    assert interval.sample(3, 30.0) == [0]  # a clip shorter than one sample still gives a frame
-    assert interval.sample(4, 1.0) == [0, 1, 2, 3]  # never more than the video has
+def test_moment_reads_the_video_at_2_fps():
+    assert moment.sample(20, 10.0) == [0, 6, 13, 19]
+    assert moment.sample(3, 30.0) == [0]  # a clip shorter than one sample still gives a frame
+    assert moment.sample(4, 1.0) == [0, 1, 2, 3]  # never more than the video has
 
 
-def test_interval_blocks_split_the_samples_without_overlap():
-    assert interval.blocks(10, 4) == [(0, 4), (4, 8), (8, 10)]
-    assert interval.blocks(3, 8) == [(0, 3)]
+def test_moment_blocks_split_the_samples_without_overlap():
+    assert moment.blocks(10, 4) == [(0, 4), (4, 8), (8, 10)]
+    assert moment.blocks(3, 8) == [(0, 3)]
 
 
 def existential(truth):
@@ -684,76 +684,76 @@ def existential(truth):
     return judge, asked
 
 
-def test_interval_finds_every_positive_sample_even_in_gaps_shorter_than_a_block():
+def test_moment_finds_every_positive_sample_even_in_gaps_shorter_than_a_block():
     truth = {33, 34, 35, 41, 42, 49, 50, 51, 52, 53, 54}  # gaps of 5 and 6 samples inside blocks of 8
     judge, _ = existential(truth)
-    assert set(interval.positives(60, 8, judge, 0.5)) == truth
+    assert set(moment.positives(60, 8, judge, 0.5)) == truth
 
 
-def test_interval_positives_match_judging_every_sample_alone():
+def test_moment_positives_match_judging_every_sample_alone():
     rng = np.random.default_rng(0)
     for _ in range(300):
         n, size = int(rng.integers(1, 80)), int(rng.integers(1, 17))
         truth = {i for i in range(n) if rng.random() < rng.choice([0.05, 0.3, 0.8])}
         judge, _ = existential(truth)
-        assert set(interval.positives(n, size, judge, 0.5)) == truth, (n, size, truth)
+        assert set(moment.positives(n, size, judge, 0.5)) == truth, (n, size, truth)
 
 
-def test_interval_positives_judge_blocks_then_the_samples_of_passing_blocks():
+def test_moment_positives_judge_blocks_then_the_samples_of_passing_blocks():
     calls = []
     judge, asked = existential({5})
-    interval.positives(64, 8, lambda ranges, t: calls.append(len(ranges)) or judge(ranges, t), 0.5)
+    moment.positives(64, 8, lambda ranges, t: calls.append(len(ranges)) or judge(ranges, t), 0.5)
     assert calls == [8, 8] and asked[8:] == [(i, i + 1) for i in range(8)]  # two rounds; empty blocks are dropped whole
 
 
-def test_interval_positives_of_single_sample_blocks_take_one_round():
+def test_moment_positives_of_single_sample_blocks_take_one_round():
     calls = []
     judge, _ = existential({2})
-    assert set(interval.positives(5, 1, lambda ranges, t: calls.append(len(ranges)) or judge(ranges, t), 0.5)) == {2}
+    assert set(moment.positives(5, 1, lambda ranges, t: calls.append(len(ranges)) or judge(ranges, t), 0.5)) == {2}
     assert calls == [5]
 
 
-def test_interval_positives_trust_the_samples_over_their_block():
+def test_moment_positives_trust_the_samples_over_their_block():
     judge = lambda ranges, threshold: [(b - a == 8, 0.6) for a, b in ranges]  # every block passes, no sample does
-    assert interval.positives(16, 8, judge, 0.5) == {}
+    assert moment.positives(16, 8, judge, 0.5) == {}
 
 
-def test_interval_blocks_pass_at_half_the_threshold():
+def test_moment_blocks_pass_at_half_the_threshold():
     # a model gives a block with one positive sample in it 0.4, below the threshold, and the sample itself 0.9
     def judge(ranges, threshold):
         values = [0.9 if (a, b) == (5, 6) else 0.4 if a <= 5 < b else 0.0 for a, b in ranges]
         return [(v >= threshold, v) for v in values]
-    assert interval.positives(16, 8, judge, 0.5) == {5: 0.9}
+    assert moment.positives(16, 8, judge, 0.5) == {5: 0.9}
 
 
-def test_interval_positives_keep_the_value_of_each_sample():
+def test_moment_positives_keep_the_value_of_each_sample():
     judge = lambda ranges, threshold: [(True, 0.5 + a / 100) for a, b in ranges]
-    assert interval.positives(3, 2, judge, 0.5) == {0: pytest.approx(0.5), 1: pytest.approx(0.51), 2: pytest.approx(0.52)}
+    assert moment.positives(3, 2, judge, 0.5) == {0: pytest.approx(0.5), 1: pytest.approx(0.51), 2: pytest.approx(0.52)}
 
 
-def test_interval_runs_of_neighbouring_samples():
-    assert interval.runs([0, 1, 4, 5, 6, 9]) == [(0, 1), (4, 6), (9, 9)]
-    assert interval.runs([]) == []
+def test_moment_runs_of_neighbouring_samples():
+    assert moment.runs([0, 1, 4, 5, 6, 9]) == [(0, 1), (4, 6), (9, 9)]
+    assert moment.runs([]) == []
 
 
-def test_interval_edges_are_the_passing_frames_joined_to_the_sample():
+def test_moment_edges_are_the_passing_frames_joined_to_the_sample():
     hits = set(range(13, 31))
     calls = []
     judge = lambda frames_: calls.append(list(frames_)) or [f in hits for f in frames_]
     # the start lies after the failing sample at frame 5, up to the passing one at 15; the end after 25, before 40
-    assert interval.edges([(15, 5), (25, 40)], judge) == [13, 30]
+    assert moment.edges([(15, 5), (25, 40)], judge) == [13, 30]
     assert calls == [list(range(6, 15)) + list(range(26, 40))]  # every frame between, in one round
-    assert interval.edges([(5, -1), (25, 50)], lambda f: [True] * len(f)) == [0, 49]  # out to the ends of the video
-    assert interval.edges([(0, -1), (49, 50)], lambda f: 1 / 0) == [0, 49]  # nothing between: nothing judged
+    assert moment.edges([(5, -1), (25, 50)], lambda f: [True] * len(f)) == [0, 49]  # out to the ends of the video
+    assert moment.edges([(0, -1), (49, 50)], lambda f: 1 / 0) == [0, 49]  # nothing between: nothing judged
 
 
-def test_interval_edges_stop_at_the_first_failing_frame():
+def test_moment_edges_stop_at_the_first_failing_frame():
     hits = {8, 9, 12, 13, 14, 26, 27, 30}  # a pass at 8 or 30 does not join the sample across a failing frame
-    assert interval.edges([(15, 5), (25, 40)], lambda f: [x in hits for x in f]) == [12, 27]
+    assert moment.edges([(15, 5), (25, 40)], lambda f: [x in hits for x in f]) == [12, 27]
 
 
-class IntervalModel:
-    """Says yes when any frame it sees has a brightness in `hits` (frame i of interval_video has brightness i / 100)."""
+class MomentModel:
+    """Says yes when any frame it sees has a brightness in `hits` (frame i of moment_video has brightness i / 100)."""
     max_images, max_options, max_levels = 4, 255, 10
     confidence = staticmethod(lambda known, unknown: 0.0)
 
@@ -770,20 +770,20 @@ class IntervalModel:
         return out
 
 
-def interval_video(n=60):
+def moment_video(n=60):
     """n frames at 10 fps; frame i has brightness i / 100 so the fake model can tell them apart."""
     images = torch.arange(n).float().div(100).view(n, 1, 1, 1).expand(n, 64, 64, 3).contiguous()  # large enough to encode when trimmed
     return InputImpl.VideoFromComponents(Types.VideoComponents(images=images, frame_rate=Fraction(10)))
 
 
 def search(model, video, window=2, threshold=0.5, images=None):
-    return interval.IntervalSearch.execute(model=model, video=video, instructions="It moves.", state="", window=window, threshold=threshold, images=images).result
+    return moment.MomentSearch.execute(model=model, video=video, instructions="It moves.", state="", window=window, threshold=threshold, images=images).result
 
 
 @pytest.mark.parametrize("max_videos", [math.inf, 0])
-def test_interval_node_finds_each_interval_to_the_source_frame(max_videos):
-    model = IntervalModel(max_videos, hits=set(range(20, 34)))
-    intervals, videos = search(model, interval_video())
+def test_moment_node_finds_each_interval_to_the_source_frame(max_videos):
+    model = MomentModel(max_videos, hits=set(range(20, 34)))
+    intervals, videos = search(model, moment_video())
     assert json.loads(intervals) == [{"start": 2.0, "end": 3.4, "start_frame": 20, "end_frame": 34, "score": pytest.approx(0.9)}]
     assert len(videos) == 1 and videos[0].get_components().images.shape[0] == 14
     if max_videos:  # 12 samples over 59 source frames; the edges are single source frames
@@ -791,45 +791,45 @@ def test_interval_node_finds_each_interval_to_the_source_frame(max_videos):
         assert all(r[1][0].fps == pytest.approx(rate) or (r[1][0].fps == 10.0 and len(r[1][0].frames) == 1) for r in model.requests)
 
 
-def test_interval_node_splits_intervals_at_a_gap_shorter_than_the_window():
+def test_moment_node_splits_intervals_at_a_gap_shorter_than_the_window():
     # samples at 0 5 11 16 21 27 32 38 43 48 54 59; the gap of 27 32 38 lies inside one block of 8
-    intervals, videos = search(IntervalModel(math.inf, hits=set(range(20, 25)) | set(range(40, 45))), interval_video(), window=8)
+    intervals, videos = search(MomentModel(math.inf, hits=set(range(20, 25)) | set(range(40, 45))), moment_video(), window=8)
     assert [(f["start_frame"], f["end_frame"]) for f in json.loads(intervals)] == [(20, 25), (40, 45)] and len(videos) == 2
 
 
-def test_interval_node_progress_only_moves_forward(monkeypatch):
+def test_moment_node_progress_only_moves_forward(monkeypatch):
     seen = []
     monkeypatch.setattr(comfy.utils, "PROGRESS_BAR_HOOK", lambda value, total, preview, node_id=None: seen.append((value, total)))
-    search(IntervalModel(math.inf, hits=set(range(20, 25)) | set(range(40, 45))), interval_video(), window=4)
+    search(MomentModel(math.inf, hits=set(range(20, 25)) | set(range(40, 45))), moment_video(), window=4)
     assert [v for v, _ in seen] == sorted(v for v, _ in seen) and seen[-1] == (300, 300) and {t for _, t in seen} == {300}
 
 
-def test_interval_node_trims_an_interval_that_reaches_the_end():
-    intervals, videos = search(IntervalModel(math.inf, hits=set(range(40, 60))), interval_video())
+def test_moment_node_trims_an_interval_that_reaches_the_end():
+    intervals, videos = search(MomentModel(math.inf, hits=set(range(40, 60))), moment_video())
     assert json.loads(intervals)[-1]["end_frame"] == 60
     assert videos[-1] is not None and videos[-1].get_components().images.shape[0] == 20
 
 
-def test_interval_node_keeps_the_trim_end_of_a_trimmed_file(tmp_path):
+def test_moment_node_keeps_the_trim_end_of_a_trimmed_file(tmp_path):
     path = tmp_path / "clip.mp4"
     write_clip(path, "libx264")  # 23 frames at 6 fps
     video = InputImpl.VideoFromFile(str(path)).as_trimmed(0.4, 1.6)
     total = frames.frame_count(video)
-    model = IntervalModel(math.inf, hits=set(range(101)))  # every frame passes
+    model = MomentModel(math.inf, hits=set(range(101)))  # every frame passes
     intervals, videos = search(model, video)
     assert json.loads(intervals)[-1]["end_frame"] == total
     assert videos[-1].get_components().images.shape[0] == total
 
 
-def test_interval_node_blocks_video_nodes_when_nothing_is_found():
-    intervals, videos = search(IntervalModel(math.inf, hits=set()), interval_video())
+def test_moment_node_blocks_video_nodes_when_nothing_is_found():
+    intervals, videos = search(MomentModel(math.inf, hits=set()), moment_video())
     assert json.loads(intervals) == [] and len(videos) == 1 and isinstance(videos[0], ExecutionBlocker)
 
 
 @pytest.mark.parametrize("max_videos", [math.inf, 0])
-def test_interval_node_without_images_judges_the_frames_alone(max_videos):
-    model = IntervalModel(max_videos, hits=set(range(20, 34)))
-    search(model, interval_video(), window=2)
+def test_moment_node_without_images_judges_the_frames_alone(max_videos):
+    model = MomentModel(max_videos, hits=set(range(20, 34)))
+    search(model, moment_video(), window=2)
     if max_videos:
         assert all(images == [] and len(videos) == 1 for images, videos, *_ in model.requests)
     else:
@@ -837,10 +837,10 @@ def test_interval_node_without_images_judges_the_frames_alone(max_videos):
 
 
 @pytest.mark.parametrize("max_videos", [math.inf, 0])
-def test_interval_node_shows_every_judgment_the_reference_images(max_videos):
-    model = IntervalModel(max_videos, hits=set(range(20, 34)))
+def test_moment_node_shows_every_judgment_the_reference_images(max_videos):
+    model = MomentModel(max_videos, hits=set(range(20, 34)))
     reference = torch.full((2, 64, 64, 3), 0.5)  # two images in one slot, brightness 50: never a hit
-    intervals, _ = search(model, interval_video(), window=1 if not max_videos else 2, images={"image_0": reference})
+    intervals, _ = search(model, moment_video(), window=1 if not max_videos else 2, images={"image_0": reference})
     assert [(f["start_frame"], f["end_frame"]) for f in json.loads(intervals)] == [(20, 34)]
     assert all(len(images) >= 2 and all(torch.equal(i, r) for i, r in zip(images[:2], reference)) for images, *_ in model.requests)
     if max_videos:
@@ -849,14 +849,14 @@ def test_interval_node_shows_every_judgment_the_reference_images(max_videos):
         assert all(len(images) == 3 for images, *_ in model.requests)
 
 
-def test_interval_node_counts_the_reference_images_against_the_image_limit():
-    model = IntervalModel(0, hits=set())  # takes at most 4 images, as frames
+def test_moment_node_counts_the_reference_images_against_the_image_limit():
+    model = MomentModel(0, hits=set())  # takes at most 4 images, as frames
     with pytest.raises(ValueError, match="at most 4 images"):
-        search(model, interval_video(), window=2, images={"image_0": torch.zeros(3, 8, 8, 3)})
+        search(model, moment_video(), window=2, images={"image_0": torch.zeros(3, 8, 8, 3)})
 
 
-def test_interval_node_asks_noul_only():
-    inputs = schema_inputs(interval.IntervalSearch)
+def test_moment_node_asks_noul_only():
+    inputs = schema_inputs(moment.MomentSearch)
     # in Typed Decision's order: the question, the model, the media, the state
     assert list(inputs) == ["instructions", "criteria_true", "criteria_false", "model", "images", "video", "state", "window", "threshold"]
     strip = lambda i: {k: v for k, v in i.as_dict().items() if k != "tooltip"}
