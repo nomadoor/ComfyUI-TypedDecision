@@ -108,11 +108,15 @@
       },
       "widgets_values": [
         "qwen3.5_4b_int8_convrot.safetensors",
-        "imajev-4b"
+        "imajev-4b",
+        false,
+        true
       ],
       "widgets_values_named": {
         "backbone": "qwen3.5_4b_int8_convrot.safetensors",
-        "adapter": "imajev-4b"
+        "adapter": "imajev-4b",
+        "adapter.debias": false,
+        "adapter.calibration": true
       },
       "color": "#232",
       "bgcolor": "#353"
@@ -194,18 +198,14 @@
         "How usable is this photo for a training dataset?",
         "unusable: blurry, dark or badly cropped\npoor\nacceptable\ngood\nexcellent: sharp, well lit, subject fills the frame",
         "",
-        0.5,
-        false,
-        true
+        0.5
       ],
       "widgets_values_named": {
         "mode": "score",
         "mode.instructions": "How usable is this photo for a training dataset?",
         "mode.criteria": "unusable: blurry, dark or badly cropped\npoor\nacceptable\ngood\nexcellent: sharp, well lit, subject fills the frame",
         "state": "",
-        "threshold": 0.5,
-        "debias": false,
-        "calibration": true
+        "threshold": 0.5
       },
       "color": "#232",
       "bgcolor": "#353"

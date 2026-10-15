@@ -142,11 +142,15 @@
       },
       "widgets_values": [
         "qwen3.5_4b_int8_convrot.safetensors",
-        "imajev-4b"
+        "imajev-4b",
+        false,
+        true
       ],
       "widgets_values_named": {
         "backbone": "qwen3.5_4b_int8_convrot.safetensors",
-        "adapter": "imajev-4b"
+        "adapter": "imajev-4b",
+        "adapter.debias": false,
+        "adapter.calibration": true
       },
       "color": "#232",
       "bgcolor": "#353"
@@ -265,9 +269,7 @@
         "five or more people are visible",
         "four or fewer people are visible",
         "",
-        0.5,
-        false,
-        true
+        0.5
       ],
       "widgets_values_named": {
         "mode": "noul",
@@ -275,9 +277,7 @@
         "mode.criteria_true": "five or more people are visible",
         "mode.criteria_false": "four or fewer people are visible",
         "state": "",
-        "threshold": 0.5,
-        "debias": false,
-        "calibration": true
+        "threshold": 0.5
       },
       "color": "#232",
       "bgcolor": "#353"

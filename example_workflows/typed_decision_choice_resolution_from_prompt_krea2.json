@@ -503,18 +503,14 @@
         "Which aspect ratio suits the image described in the state?",
         "portrait: tall subject, such as a standing person\nlandscape: wide scene, such as scenery or a group\nsquare: single object or close-up",
         "",
-        0.5,
-        false,
-        true
+        0.5
       ],
       "widgets_values_named": {
         "mode": "choice",
         "mode.instructions": "Which aspect ratio suits the image described in the state?",
         "mode.criteria": "portrait: tall subject, such as a standing person\nlandscape: wide scene, such as scenery or a group\nsquare: single object or close-up",
         "state": "",
-        "threshold": 0.5,
-        "debias": false,
-        "calibration": true
+        "threshold": 0.5
       },
       "color": "#232",
       "bgcolor": "#353"
@@ -548,11 +544,15 @@
       },
       "widgets_values": [
         "qwen3.5_4b_int8_convrot.safetensors",
-        "imajev-4b"
+        "imajev-4b",
+        false,
+        true
       ],
       "widgets_values_named": {
         "backbone": "qwen3.5_4b_int8_convrot.safetensors",
-        "adapter": "imajev-4b"
+        "adapter": "imajev-4b",
+        "adapter.debias": false,
+        "adapter.calibration": true
       },
       "color": "#232",
       "bgcolor": "#353"

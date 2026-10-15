@@ -9,6 +9,7 @@ import torch
 import torchvision.transforms.v2.functional as TF
 from PIL import Image
 
+import comfy.model_management
 import comfy.sd
 import comfy.text_encoders.qwen35
 import comfy.utils
@@ -19,6 +20,8 @@ PIXELS = 400_000  # training / evaluation image budget
 PATCH = 32  # patch 16 x merge 2
 MIN_PIXELS, MAX_PIXELS = 65_536, 16_777_216  # Qwen3.5 preprocessor_config.json
 MAX_TOKENS = 4096
+MAX_BATCH_TOKENS = 8192  # padded tokens rows may share in one forward (the d3 runtime merges passes at this size)
+ACTIVATION_BYTES = 160  # forward memory per padded token and hidden unit (about 140 measured on d3-mini, Qwen3.5)
 BUCKETS = ((2, "2"), (5, "3-5"), (10, "6-10"), (25, "11-25"), (255, "26-254"))
 CALIBRATION_TYPES = {"noul": "boolean", "choice": "choice", "score": "ordinal"}
 CALIBRATION_FILES = ("calibration-rot4-modality.json", "calibration-modality.json", "calibration-rot4.json", "calibration.json")
@@ -36,6 +39,8 @@ def option_text(kind, value, description):
 
 
 def build_prompt(state, question, labels, offset):
+    if isinstance(state, list):
+        state = {"state": state}
     texts = [option_text(question.kind, v, d) for v, d in question.answers] + [UNKNOWN_TEXT]
     texts = texts[offset:] + texts[:offset]
     header = ("Inspect the available evidence and answer the question using the stated criteria. "
@@ -90,13 +95,13 @@ def downscale(width, height, pixels=PIXELS):
     return (max(1, int(width * scale)), max(1, int(height * scale))) if scale < 1 else (width, height)
 
 
-def grid_size(width, height):
+def grid_size(width, height, max_pixels=MAX_PIXELS, min_pixels=MIN_PIXELS):
     h, w = round(height / PATCH) * PATCH, round(width / PATCH) * PATCH
-    if h * w > MAX_PIXELS:
-        beta = math.sqrt(height * width / MAX_PIXELS)
+    if h * w > max_pixels:
+        beta = math.sqrt(height * width / max_pixels)
         h, w = max(PATCH, math.floor(height / beta / PATCH) * PATCH), max(PATCH, math.floor(width / beta / PATCH) * PATCH)
-    elif h * w < MIN_PIXELS:
-        beta = math.sqrt(MIN_PIXELS / (height * width))
+    elif h * w < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
         h, w = math.ceil(height * beta / PATCH) * PATCH, math.ceil(width * beta / PATCH) * PATCH
     return w, h
 
@@ -110,8 +115,13 @@ def prepare_image(image):
     size = downscale(width, height)
     if size != (width, height):
         u8 = torch.from_numpy(np.array(Image.fromarray(u8.numpy()).resize(size, Image.Resampling.LANCZOS)))
+    return fit_grid(u8)
+
+
+def fit_grid(u8, max_pixels=MAX_PIXELS):
+    """[H, W, 3] uint8 -> [1, H', W', 3] float: the Qwen processor's bicubic resize to the patch grid."""
     chw = u8.permute(2, 0, 1)
-    w, h = grid_size(chw.shape[2], chw.shape[1])
+    w, h = grid_size(chw.shape[2], chw.shape[1], max_pixels)
     if (w, h) != (chw.shape[2], chw.shape[1]):
         chw = TF.resize(chw, [h, w], interpolation=TF.InterpolationMode.BICUBIC, antialias=True)
     return (chw.permute(1, 2, 0).float() / 255.0).unsqueeze(0)
@@ -122,15 +132,54 @@ def image_tokens(image):
     return (h // PATCH) * (w // PATCH)
 
 
-def tokenize(tokenizer, text, images):
+def tokenize(tokenizer, text, images, videos=()):
     """Core encoder tokens for the text as written (Core's tokenize would apply SD prompt syntax such as embedding: and escapes),
-    each <|image_pad|> carrying its image."""
-    image_pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    each <|image_pad|> carrying its image and each <|video_pad|> the next of `videos`."""
+    image_pad, video_pad = tokenizer.convert_tokens_to_ids(["<|image_pad|>", "<|video_pad|>"])
     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-    if ids.count(image_pad) != len(images):
-        raise ValueError("The text must not contain <|image_pad|>.")
-    images = iter(images)
-    return [({"type": "image", "data": next(images), "original_type": "image"}, 1.0) if t == image_pad else (t, 1.0) for t in ids]
+    if ids.count(image_pad) != len(images) or ids.count(video_pad) != len(videos):
+        raise ValueError("The text must not contain <|image_pad|> or <|video_pad|>.")
+    images, videos = iter(images), iter(videos)
+    media = {image_pad: lambda: {"type": "image", "data": next(images), "original_type": "image"}, video_pad: lambda: next(videos)}
+    return [(media[t](), 1.0) if t in media else (t, 1.0) for t in ids]
+
+
+def batches(layouts, lengths, budget=MAX_BATCH_TOKENS):
+    """Row indices grouped into forwards. A batch shares one media layout, because Core gives every row the multimodal
+    positions of one row, and pads to at most `budget` tokens; a longer row runs alone."""
+    out = []
+    for layout in dict.fromkeys(layouts):
+        group = []
+        for i in (i for i, other in enumerate(layouts) if other == layout):
+            if group and (len(group) + 1) * max(lengths[j] for j in group + [i]) > budget:
+                out.append(group)
+                group = []
+            group.append(i)
+        out.append(group)
+    return out
+
+
+def memory_estimation(hidden_size):
+    """A Core memory_estimation_function for a typed-decision encoder: the activations of the padded batch, so Core
+    offloads enough weights before a large forward instead of letting it spill out of VRAM."""
+    def estimate(tokens, device=None):
+        rows = next(iter(tokens.values()))
+        longest = max(sum((t[0].get("tokens") or image_tokens(t[0]["data"])) if isinstance(t[0], dict) else 1 for t in row) for row in rows)
+        return len(rows) * longest * hidden_size * ACTIVATION_BYTES
+    return estimate
+
+
+def token_budget(patcher, hidden_size):
+    """Padded tokens one forward may hold while the whole model stays in VRAM. A forward with most weights offloaded is far
+    slower than several smaller forwards, so batches are cut to fit next to the weights. A model that cannot fit is offloaded
+    anyway, and larger batches stream its weights fewer times. Memory other programs hold on the device is not counted."""
+    free = (comfy.model_management.get_total_memory(patcher.load_device) - patcher.model_size()
+            - comfy.model_management.minimum_inference_memory())
+    return MAX_BATCH_TOKENS if free <= 0 else int(min(MAX_BATCH_TOKENS, free // (hidden_size * ACTIVATION_BYTES)))
+
+
+def media_layout(images):
+    return tuple(tuple(image.shape[1:3]) for image in images)
 
 
 def lora_to_comfy(state_dict, alpha):
@@ -149,9 +198,11 @@ def is_imajev(folder):
 
 class ImajevModel:
     max_images = 2
+    max_videos = 0
     max_levels = 10
 
-    def __init__(self, backbone_path, folder):
+    def __init__(self, backbone_path, folder, debias, calibrate):
+        self.debias = debias
         with open(os.path.join(folder, "adapter_config.json"), encoding="utf-8") as f:
             config = json.load(f)
         with open(os.path.join(folder, MARKER), encoding="utf-8") as f:
@@ -163,7 +214,7 @@ class ImajevModel:
         self.readout = comfy.utils.load_torch_file(os.path.join(folder, "decision_readout.safetensors"), safe_load=True)["weight"].float()
         if self.readout.shape[0] != len(manifest["codes"]):
             raise ValueError("decision_readout.safetensors and decision_readout.json disagree on the number of codes.")
-        self.calibration = self._load_calibration(folder)
+        self.calibration = self._load_calibration(folder) if calibrate else None
 
         clip = comfy.sd.load_clip(ckpt_paths=[backbone_path])
         mismatch = f"This adapter needs the Qwen3.5 backbone it was trained on (hidden size {self.readout.shape[1]})."
@@ -176,6 +227,7 @@ class ImajevModel:
         lora = comfy.utils.load_torch_file(os.path.join(folder, "adapter_model.safetensors"), safe_load=True)
         self.clip = comfy.sd.load_lora_for_models(None, clip, lora_to_comfy(lora, config["lora_alpha"]), 0.0, 1.0)[1]
         self.clip.clip_layer([encoder.num_layers])  # the layer after the last block: the final-normed hidden state
+        self.clip.cond_stage_model.memory_estimation_function = memory_estimation(encoder.transformer.model.config.hidden_size)
         self.pad = encoder.special_tokens["pad"]
 
         tokenizer = getattr(self.clip.tokenizer, self.name).tokenizer
@@ -189,6 +241,11 @@ class ImajevModel:
         self.tokenizer = tokenizer
 
     @staticmethod
+    def confidence(known, unknown):
+        """Jev's concentration of the known answers, scaled by the share that is not unknown."""
+        return max(0.0, (len(known) * max(known) - 1) / (len(known) - 1)) * (1 - unknown)
+
+    @staticmethod
     def _load_calibration(folder):
         for name in CALIBRATION_FILES:
             path = os.path.join(folder, name)
@@ -200,31 +257,43 @@ class ImajevModel:
                 return calibration
         return None
 
-    def decide(self, images, state, question, debias, calibrate):
-        """-> (probabilities over answers + unknown, selected index, calibration version or None)."""
-        images = [prepare_image(image) for image in images]
+    def decide(self, images, videos, state, question):
+        """-> (probabilities over answers, unknown probability, abstained, calibration version or None)."""
+        return self.decide_many([(images, videos, state, question)])[0]
+
+    def decide_many(self, requests):
+        """decide for each (images, videos, state, question); imajev takes no videos. Rows of the same media layout share forwards."""
+        requests = [([prepare_image(image) for image in images], state, question) for images, _, state, question in requests]
+        rows = []  # (request, offset, tokens, length)
+        for r, (images, state, question) in enumerate(requests):
+            n = len(question.answers) + 1
+            labels = [code for code, _ in self.codes[:n]]
+            for offset in rotation_offsets(n, self.debias):
+                tokens = tokenize(self.tokenizer, render(build_prompt(state, question, labels, offset), len(images)), images)
+                if any(t[0] == self.pad for t in tokens):  # Core masks everything after the pad token
+                    raise ValueError("The text must not contain <|endoftext|>.")
+                length = sum(image_tokens(t[0]["data"]) if isinstance(t[0], dict) else 1 for t in tokens)
+                if length > MAX_TOKENS:
+                    raise ValueError(f"The request is {length} tokens; imajev accepts at most {MAX_TOKENS}. Shorten the state or the options.")
+                rows.append((r, offset, tokens, length))
+        passes = [[] for _ in requests]  # (offset, logits) of each request
+        # Right padding cannot reach earlier positions of a causal model, so rows of one layout share a forward.
+        budget = token_budget(self.clip.patcher, self.readout.shape[1])
+        for batch in batches([media_layout(requests[r][0]) for r, *_ in rows], [length for *_, length in rows], budget):
+            longest = max(len(rows[i][2]) for i in batch)
+            cond = self.clip.encode_from_tokens({self.name: [rows[i][2] + [(self.pad, 1.0)] * (longest - len(rows[i][2])) for i in batch]})
+            hidden = cond.reshape(len(batch), -1, self.readout.shape[1])
+            last = hidden[range(len(batch)), [rows[i][3] - 1 for i in batch]].float()
+            n = max(len(requests[rows[i][0]][2].answers) + 1 for i in batch)
+            for i, row in zip(batch, (last @ self.readout[:n].to(hidden.device).T).tolist()):
+                r, offset = rows[i][:2]
+                passes[r].append((offset, row[:len(requests[r][2].answers) + 1]))
+        return [self._combine(images, state, question, passes[r]) for r, (images, state, question) in enumerate(requests)]
+
+    def _combine(self, images, state, question, passes):
+        """One request's decision from its presentation passes (offset, logits)."""
         n = len(question.answers) + 1
-        labels = [code for code, _ in self.codes[:n]]
         token_ids = [token for _, token in self.codes[:n]]
-        readout = self.readout[:n]
-        offsets = rotation_offsets(n, debias)
-        prompts, lengths = [], []
-        for offset in offsets:
-            tokens = tokenize(self.tokenizer, render(build_prompt(state, question, labels, offset), len(images)), images)
-            if any(t[0] == self.pad for t in tokens):  # Core masks everything after the pad token
-                raise ValueError("The text must not contain <|endoftext|>.")
-            length = sum(image_tokens(t[0]["data"]) if isinstance(t[0], dict) else 1 for t in tokens)
-            if length > MAX_TOKENS:
-                raise ValueError(f"The request is {length} tokens; imajev accepts at most {MAX_TOKENS}. Shorten the state or the options.")
-            prompts.append(tokens)
-            lengths.append(length)
-        # All presentation orders in one forward: right padding cannot reach earlier positions of a causal model.
-        longest = max(len(p) for p in prompts)
-        cond = self.clip.encode_from_tokens({self.name: [p + [(self.pad, 1.0)] * (longest - len(p)) for p in prompts]})
-        hidden = cond.reshape(len(prompts), -1, readout.shape[1])
-        last = hidden[range(len(prompts)), [length - 1 for length in lengths]].float()
-        logits = (last @ readout.to(hidden.device).T).tolist()
-        passes = list(zip(offsets, logits))
         if len(passes) == 1:
             logits = passes[0][1]
             selected = select(logits, token_ids)
@@ -232,7 +301,8 @@ class ImajevModel:
             logits = combine_rotations(passes, n)
             selected = max(range(n), key=logits.__getitem__)
         t, version = None, None
-        if calibrate and self.calibration is not None:
-            t = temperature(self.calibration, question.kind, n - 1, photo_only=bool(images) and not state)
+        if self.calibration is not None:
+            t = temperature(self.calibration, question.kind, n - 1, photo_only=bool(images) and state == {})
             version = self.calibration.get("calibration_version") if t is not None else None
-        return softmax(logits, t or 1.0), selected, version
+        scores = softmax(logits, t or 1.0)
+        return scores[:-1], scores[-1], selected == n - 1, version
