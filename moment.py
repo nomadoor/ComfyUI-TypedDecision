@@ -8,6 +8,7 @@ streams its weights for each. Questions are about what one frame shows; motion i
 import json
 
 import numpy as np
+import torch
 
 import comfy.model_management
 import comfy.utils
@@ -129,6 +130,8 @@ class MomentSearch(io.ComfyNode):
             raise ValueError("The video has no frames in its trim window.")
         video_fps = float(video.get_frame_rate())
         resize = lambda frame: d3.resize_frame(frame, 2 * window)  # the size d3 gives a window, which it reads each frame of twice; Clef sees this size too
+        # the references within the frames' pixel budget too: they are compared with frames that small, and every judgment carries them
+        references = [resize((image[..., :3].cpu() * 255).round().clamp(0, 255).to(torch.uint8)).float() / 255 for image in references]
 
         indices = sample(total, video_fps)
         u8 = frames.read_frames(video, indices, resize)

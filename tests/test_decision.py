@@ -842,11 +842,19 @@ def test_moment_node_shows_every_judgment_the_reference_images(max_videos):
     reference = torch.full((2, 64, 64, 3), 0.5)  # two images in one slot, brightness 50: never a hit
     intervals, _ = search(model, moment_video(), window=1 if not max_videos else 2, images={"image_0": reference})
     assert [(f["start_frame"], f["end_frame"]) for f in json.loads(intervals)] == [(20, 34)]
-    assert all(len(images) >= 2 and all(torch.equal(i, r) for i, r in zip(images[:2], reference)) for images, *_ in model.requests)
+    assert all(len(images) >= 2 and all(torch.allclose(i, r, atol=1 / 255) for i, r in zip(images[:2], reference)) for images, *_ in model.requests)
     if max_videos:
         assert all(len(images) == 2 and len(videos) == 1 for images, videos, *_ in model.requests)
     else:  # window 1: the two references, then the frame
         assert all(len(images) == 3 for images, *_ in model.requests)
+
+
+def test_moment_node_reads_the_references_at_the_frame_size():
+    model = MomentModel(math.inf, hits=set())
+    search(model, moment_video(), window=2, images={"image_0": torch.full((1, 1080, 1920, 3), 0.5)})
+    w, h = d3.video_size(1920, 1080, 4)  # as a frame of the window, which d3 reads twice
+    assert {tuple(images[0].shape) for images, *_ in model.requests} == {(h, w, 3)}
+    assert float(model.requests[0][0][0].mean()) == pytest.approx(0.5, abs=1 / 255)
 
 
 def test_moment_node_counts_the_reference_images_against_the_image_limit():
