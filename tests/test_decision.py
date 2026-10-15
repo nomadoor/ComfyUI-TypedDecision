@@ -443,14 +443,15 @@ def fake_judge(hits, levels=None):
     """Positive where the crop contains any of the points in hits; records each crop and, in levels, each call's size."""
     calls = []
 
-    def judge(boxes, threshold):
+    def judge(chains, threshold):
         out = []
-        for x0, y0, x1, y1 in boxes:
+        for chain in chains:
+            x0, y0, x1, y1 = chain[-1]
             calls.append(((x0, y0, x1, y1), threshold))
             value = 1.0 if any(x0 <= x < x1 and y0 <= y < y1 for x, y in hits) else 0.0
             out.append((value, value >= threshold))
         if levels is not None:
-            levels.append(len(boxes))
+            levels.append(len(chains))
         return out
     return judge, calls
 
@@ -475,6 +476,30 @@ def test_region_search_judges_widened_crops():
     tiles = region.search(judge, 64, 64, 1, 0.5, 0.5, 0.25)
     assert calls[1][0] == (0, 0, 48, 48)  # the corner tile keeps the full widened size
     assert {(t.row, t.col) for t in tiles if t.positive and t.depth == 1} == {(0, 0), (0, 1)}
+
+
+def test_region_search_judges_each_tile_with_the_crops_above_it():
+    chains = []
+    region.search(lambda c, threshold: chains.extend(c) or [(1.0, True)] * len(c), 64, 64, 2, 0.5, 0.5, 0.0)
+    assert chains[0] == [(0, 0, 64, 64)]
+    assert chains[-1] == [(0, 0, 64, 64), (32, 32, 64, 64), (48, 48, 64, 64)]  # the last tile of depth 2, under the last of depth 1
+
+
+def test_region_views_frame_the_next_crop_in_red_and_end_with_the_tile():
+    frame = torch.zeros(1000, 800, 3)
+    views = region.views(frame, [(0, 0, 800, 1000), (400, 500, 800, 1000), (600, 750, 800, 1000)])
+    assert [tuple(v.shape) for v in views] == [(448, 358, 3), (448, 358, 3), (250, 200, 3)]  # crops above shrunk to 448, the tile as it is
+    assert views[0][300, 180, 0] > 0.5 and views[0][300, 180, 1] < 0.2  # the left edge of the next crop, in red
+    assert views[0][100, 100].max() == 0 and views[0][300, 250].max() == 0  # nothing drawn outside the edge or inside the box
+    assert views[2].max() == 0  # the tile itself is not drawn on
+
+
+def test_region_views_keep_small_crops_and_draw_every_edge():
+    frame = torch.zeros(100, 80, 3)
+    above, tile = region.views(frame, [(0, 0, 80, 100), (40, 50, 80, 100)])
+    assert above.shape == (100, 80, 3) and tile.shape == (50, 40, 3)
+    assert [above[y, x, 0].item() for y, x in ((50, 60), (99, 60), (75, 40), (75, 79))] == [1.0] * 4  # top, bottom, left, right
+    assert above[75, 60].max() == 0 and frame.max() == 0  # inside the box, and the input image, untouched
 
 
 def test_region_search_stops_without_a_hit_and_on_tiny_tiles():
@@ -510,31 +535,55 @@ def test_region_boxes_join_4_neighbour_leaves_across_depths():
 def test_region_mask_and_heatmap():
     tiles = [tile(0, 0, 0, 0.5), tile(1, 0, 0, 0.25, False), tile(1, 0, 1, 1.0), tile(1, 1, 0, 0.0, False), tile(1, 1, 1, 0.0, False)]
     assert region.mask(region.leaves(tiles), 4, 2).tolist() == [[0, 0, 1, 1], [0, 0, 0, 0]]
-    heat = region.heatmap(tiles, 4, 2, 0.5)
-    assert heat.shape == (2, 4, 3) and heat[..., 0].tolist() == [[0.5, 0.5, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]]
+    heat = region.heatmap(tiles, 4, 2)
+    assert heat.shape == (2, 4, 3) and heat[..., 0].tolist() == [[0.25, 0.25, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]]
 
 
 def test_region_node_searches_each_image_of_the_batch():
     calls = []
 
     class Model:
-        max_images, max_videos, max_options, max_levels = 1, 0, 255, 10
+        max_images, max_videos, max_options, max_levels = 4, 0, 255, 10
 
         def decide_many(self, requests):
-            calls.extend((tuple(images[0].shape), state, question.kind) for images, _, state, question in requests)
+            calls.extend(([tuple(i.shape) for i in images], state, question.text) for images, _, state, question in requests)
             return [([0.9, 0.1], None, False, None)] * len(requests)
 
-    out = region.RegionSearch.execute({"mode": "noul", "instructions": "A cat."}, Model(), torch.rand(2, 32, 48, 3), '{"a": 1}', 1, 0.3, 0.6, 0.0)
+    out = region.RegionSearch.execute(model=Model(), image=torch.rand(2, 32, 48, 3), instructions="A cat.", state='{"a": 1}', max_depth=1,
+                                      threshold_top=0.3, threshold_bottom=0.6, context_margin=0.0)
     mask, bboxes, heat = out.result
-    assert len(calls) == 2 * 5 and calls[0] == ((32, 48, 3), {"a": 1}, "noul") and calls[1][0] == (16, 24, 3)
+    assert len(calls) == 2 * 5 and calls[0] == ([(32, 48, 3)], {"a": 1}, "A cat.")  # the whole image alone needs no zoom
+    assert calls[1] == ([(32, 48, 3), (16, 24, 3)], {"a": 1}, region.ZOOM + "A cat.")  # the whole image, then the tile
     assert mask.shape == (2, 32, 48) and mask.min() == 1 and heat.shape == (2, 32, 48, 3)
     assert bboxes == [[{"x": 0, "y": 0, "width": 48, "height": 32, "score": pytest.approx(0.9)}]] * 2
 
 
-def test_region_node_shares_the_decision_mode():
+def test_region_node_asks_noul_only():
     inputs = schema_inputs(region.RegionSearch)
-    assert list(inputs) == ["mode", "model", "image", "state", "max_depth", "threshold_top", "threshold_bottom", "context_margin"]
-    assert inputs["mode"].as_dict() == schema_inputs(TypedDecision)["mode"].as_dict()
+    assert list(inputs) == ["instructions", "criteria_true", "criteria_false", "model", "image", "state", "max_depth", "threshold_top", "threshold_bottom", "context_margin"]
+    assert [i.as_dict() for i in inputs.values()][:3] == [i.as_dict() for i in nodes.noul_inputs()]
+
+
+def test_region_node_rejects_an_empty_question():
+    with pytest.raises(ValueError, match="instructions is empty"):
+        region.RegionSearch.execute(model=None, image=torch.rand(1, 8, 8, 3), instructions=" ", state="", max_depth=1,
+                                    threshold_top=0.3, threshold_bottom=0.6, context_margin=0.0)
+
+
+def test_region_node_shows_imajev_the_whole_image_and_the_tile():
+    seen = []
+
+    class Model:
+        max_images, max_videos, max_options, max_levels = 2, 0, 255, 10
+        confidence = staticmethod(lambda known, unknown: 0.0)
+
+        def decide_many(self, requests):
+            seen.extend([tuple(i.shape) for i in images] for images, *_ in requests)
+            return [([0.9, 0.1], None, False, None)] * len(requests)
+
+    region.RegionSearch.execute(model=Model(), image=torch.rand(1, 64, 64, 3), instructions="A cat.", state="", max_depth=2,
+                                threshold_top=0.3, threshold_bottom=0.6, context_margin=0.0)
+    assert seen[-1] == [(64, 64, 3), (16, 16, 3)]
 
 
 def test_memory_estimation_counts_the_padded_batch_with_image_tokens():
